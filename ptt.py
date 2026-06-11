@@ -1231,11 +1231,29 @@ def _match_voice_command(text, commands, prefix):
 
     return None, False
 
+# Media keys go through native keybd_event: pynput's injected input crashed
+# the process when fired re-entrantly, and extended keys are exactly what the
+# raw API exists for. Never sent from inside an input-hook callback (commands
+# run on a worker thread).
+_MEDIA_VK = {
+    "play_pause": 0xB3, "next_track": 0xB0, "prev_track": 0xB1,
+    "volume_up": 0xAF, "volume_down": 0xAE, "volume_mute": 0xAD,
+}
+
+def _tap_media_vk(vk):
+    import ctypes
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP = 0x1, 0x2
+    ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY, 0)
+    ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+
 def _send_keys(spec):
     parts = [p.strip().lower() for p in spec.split("+") if p.strip()]
-    keys = [_KEYNAMES.get(p, p) for p in parts]
-    if not keys:
+    if not parts:
         return
+    if len(parts) == 1 and parts[0] in _MEDIA_VK:
+        _tap_media_vk(_MEDIA_VK[parts[0]])
+        return
+    keys = [_KEYNAMES.get(p, p) for p in parts]
     *mods, last = keys
     if mods:
         with key_sender.pressed(*mods):
@@ -1266,13 +1284,20 @@ def try_voice_command(text):
         logging.info(f"voice command: no match for {text!r}")
         beep_async([(400, 120)])
         return True
-    try:
-        _execute_voice_command(action)
-        logging.info(f"voice command: {text!r} -> {action!r}")
-        beep_async([(880, 60), (1175, 80)])
-    except Exception:
-        logging.exception(f"voice command failed: {action!r}")
-        beep_async([(400, 120)])
+
+    def run():
+        try:
+            _execute_voice_command(action)
+            logging.info(f"voice command: {text!r} -> {action!r}")
+            beep_async([(880, 60), (1175, 80)])
+        except Exception:
+            logging.exception(f"voice command failed: {action!r}")
+            beep_async([(400, 120)])
+
+    # Worker thread: never execute (especially key injection) from inside the
+    # input-hook callback that delivered the PTT release — re-entrancy there
+    # has crashed the process natively.
+    threading.Thread(target=run, daemon=True).start()
     return True
 
 _RESTRUCTURE_INSTRUCTION = (

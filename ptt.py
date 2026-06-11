@@ -1158,6 +1158,13 @@ _KEYNAMES = {
     "esc": keyboard.Key.esc, "space": keyboard.Key.space, "del": keyboard.Key.delete,
     "home": keyboard.Key.home, "end": keyboard.Key.end,
     "printscreen": keyboard.Key.print_screen, "prtsc": keyboard.Key.print_screen,
+    # global media keys — players (Spotify etc.) obey these without focus
+    "play_pause": keyboard.Key.media_play_pause,
+    "next_track": keyboard.Key.media_next,
+    "prev_track": keyboard.Key.media_previous,
+    "volume_up": keyboard.Key.media_volume_up,
+    "volume_down": keyboard.Key.media_volume_down,
+    "volume_mute": keyboard.Key.media_volume_mute,
     **{f"f{i}": getattr(keyboard.Key, f"f{i}") for i in range(1, 21)},
 }
 

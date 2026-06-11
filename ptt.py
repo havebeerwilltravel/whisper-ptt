@@ -99,6 +99,8 @@ CAPTURE_KEY      = keyboard.Key.f15      # note-capture PTT: silent append to yo
 REPASTE_KEY      = keyboard.Key.f16      # re-paste the last transcript at current focus
 CAPTURE_STRUCT_KEY = keyboard.Key.f17    # like capture, but the ramble is restructured
                                          # into bullets/action items before it lands
+TOGGLE_KEY       = keyboard.Key.f18      # tap: start / pause / resume an open recording
+FINISH_KEY       = keyboard.Key.f19      # tap: finish the open recording → transcribe & paste
 PTT_MOUSE_BUTTON = mouse.Button.x2       # mouse PTT hold (front thumb button)
 
 # Note-capture: hold CAPTURE_KEY, talk, release — the transcript is delivered
@@ -156,6 +158,7 @@ _SETTINGS_DEFAULTS = {
     "vad_enabled": False, "hot_mic": False,
     "ptt_key": "ctrl_r", "hot_mic_key": "f10", "vad_key": "f8", "teach_key": "f7",
     "capture_key": "f15", "repaste_key": "f16", "capture_struct_key": "f17",
+    "toggle_key": "f18", "finish_key": "f19",
     "ptt_mouse_button": "x2",
     "capture_uri": CAPTURE_URI, "capture_text_uri": CAPTURE_TEXT_URI,
     "capture_file": CAPTURE_FILE, "capture_entry": CAPTURE_ENTRY,
@@ -188,6 +191,8 @@ def save_settings() -> None:
         "capture_key": _key_to_str(CAPTURE_KEY),
         "repaste_key": _key_to_str(REPASTE_KEY),
         "capture_struct_key": _key_to_str(CAPTURE_STRUCT_KEY),
+        "toggle_key": _key_to_str(TOGGLE_KEY),
+        "finish_key": _key_to_str(FINISH_KEY),
         "ptt_mouse_button": _button_to_str(PTT_MOUSE_BUTTON),
         "capture_uri": CAPTURE_URI, "capture_text_uri": CAPTURE_TEXT_URI,
         "capture_file": CAPTURE_FILE, "capture_entry": CAPTURE_ENTRY,
@@ -318,6 +323,7 @@ class State(Enum):
     CHECKING = 2     # silence gap, transcribing to check for over/disregard
     PROCESSING = 4   # transcribing F9 recording
     MANUAL = 5       # F9 held down
+    PAUSED = 6       # open (toggle) recording paused — audio discarded until resume
 
 state = State.IDLE
 state_lock = threading.Lock()
@@ -415,6 +421,8 @@ for _attr, _setting, _default in [
     ("CAPTURE_KEY", "capture_key", keyboard.Key.f15),
     ("REPASTE_KEY", "repaste_key", keyboard.Key.f16),
     ("CAPTURE_STRUCT_KEY", "capture_struct_key", keyboard.Key.f17),
+    ("TOGGLE_KEY", "toggle_key", keyboard.Key.f18),
+    ("FINISH_KEY", "finish_key", keyboard.Key.f19),
 ]:
     try:
         globals()[_attr] = _str_to_key(_s[_setting])
@@ -439,7 +447,10 @@ _RESTORE_VERIFY_PASSES = 4     # re-check/re-apply restored volumes up to this m
 manual_chunks = []  # chunks collected during F9 hold
 _capture_session = False   # current manual recording was started by a capture key
 _capture_struct = False    # ...by the STRUCTURED capture key specifically
+_toggle_session = False    # current recording is an open (tap-to-toggle) session
 key_sender = keyboard.Controller()
+
+PAUSE_CHIRP = [(587, 70), (587, 70)]   # double mid-tone blip = paused
 
 # ── Device ──────────────────────────────────────────────────────────
 def find_device():
@@ -1392,7 +1403,7 @@ def _indicator_loop():
         while True:
             with state_lock:
                 cur = state
-            if cur in (State.MANUAL, State.PROCESSING):
+            if cur in (State.MANUAL, State.PROCESSING, State.PAUSED):
                 if not visible:
                     try:
                         x, y = pyautogui.position()
@@ -1406,21 +1417,27 @@ def _indicator_loop():
                     if not shown_once:
                         logging.info(f"indicator: first show at {x + 18},{y + 26}")
                         shown_once = True
-                hist.pop(0)
-                if cur == State.MANUAL:
-                    hist.append(min(1.0, (max(_mic_rms, 0.0) * 8.0) ** 0.7))
-                    color = "#4aa3ff"                       # blue: recording
-                else:
-                    hist.append(0.55 + 0.4 * np.sin(time.time() * 6.0))
-                    color = "#ff9f40"                       # orange: transcribing
                 canvas.delete("all")
-                bw, gap = 8, 6
-                x0 = (W - (N * bw + (N - 1) * gap)) // 2
-                for i, v in enumerate(hist):
-                    h = max(3, int(v * (H - 10)))
-                    cx = x0 + i * (bw + gap)
-                    canvas.create_rectangle(cx, H // 2 - h // 2, cx + bw,
-                                            H // 2 + h // 2, fill=color, width=0)
+                if cur == State.PAUSED:
+                    # static pause glyph — shape change, not just color
+                    for cx in (W // 2 - 12, W // 2 + 4):
+                        canvas.create_rectangle(cx, 8, cx + 8, H - 8,
+                                                fill="#8a93a6", width=0)
+                else:
+                    hist.pop(0)
+                    if cur == State.MANUAL:
+                        hist.append(min(1.0, (max(_mic_rms, 0.0) * 8.0) ** 0.7))
+                        color = "#4aa3ff"                   # blue: recording
+                    else:
+                        hist.append(0.55 + 0.4 * np.sin(time.time() * 6.0))
+                        color = "#ff9f40"                   # orange: transcribing
+                    bw, gap = 8, 6
+                    x0 = (W - (N * bw + (N - 1) * gap)) // 2
+                    for i, v in enumerate(hist):
+                        h = max(3, int(v * (H - 10)))
+                        cx = x0 + i * (bw + gap)
+                        canvas.create_rectangle(cx, H // 2 - h // 2, cx + bw,
+                                                H // 2 + h // 2, fill=color, width=0)
                 root.update()
                 time.sleep(1 / 30)
             else:
@@ -1469,8 +1486,9 @@ def vad_monitor():
             cur = state
 
         # Skip VAD processing during manual mode or processing
-        if cur in (State.MANUAL, State.PROCESSING):
-            # During manual mode, collect chunks for F9
+        if cur in (State.MANUAL, State.PROCESSING, State.PAUSED):
+            # During manual mode, collect chunks for F9. PAUSED consumes and
+            # DISCARDS chunks so stale audio never piles up for the resume.
             if cur == State.MANUAL:
                 manual_chunks.append(chunk)
             buf = np.array([], dtype=np.float32)
@@ -1598,6 +1616,7 @@ _STATE_COLORS = {
     State.MANUAL:     (50,  200,  50),
     State.CHECKING:   (220, 200,   0),
     State.PROCESSING: (220, 200,   0),
+    State.PAUSED:     (70,  130, 200),
 }
 
 def _make_tray_image(state_val: State, hot_mic_active: bool) -> Image.Image:
@@ -1770,6 +1789,10 @@ def build_menu():
                          _on_bind("repaste_key")),
         pystray.MenuItem(lambda item: f"Structured capture key: {_key_label(CAPTURE_STRUCT_KEY)}",
                          _on_bind("capture_struct_key")),
+        pystray.MenuItem(lambda item: f"Open-record toggle key: {_key_label(TOGGLE_KEY)}",
+                         _on_bind("toggle_key")),
+        pystray.MenuItem(lambda item: f"Open-record finish key: {_key_label(FINISH_KEY)}",
+                         _on_bind("finish_key")),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(lambda item: f"PTT mouse button: {_button_label(PTT_MOUSE_BUTTON)}",
                          _on_bind("ptt_mouse_button")),
@@ -1829,7 +1852,7 @@ def start_tray():
 def _finish_bind(mode: str, key: keyboard.Key | keyboard.KeyCode) -> None:
     """Assign the captured key to the binding target and persist."""
     global PTT_KEY, HOT_MIC_KEY, VAD_KEY, TEACH_KEY, CAPTURE_KEY, REPASTE_KEY, \
-           CAPTURE_STRUCT_KEY, _binding_mode
+           CAPTURE_STRUCT_KEY, TOGGLE_KEY, FINISH_KEY, _binding_mode
     if key == keyboard.Key.esc:          # Escape cancels without changing anything
         logging.info("Bind cancelled (Escape)")
     else:
@@ -1847,6 +1870,10 @@ def _finish_bind(mode: str, key: keyboard.Key | keyboard.KeyCode) -> None:
             REPASTE_KEY = key
         elif mode == "capture_struct_key":
             CAPTURE_STRUCT_KEY = key
+        elif mode == "toggle_key":
+            TOGGLE_KEY = key
+        elif mode == "finish_key":
+            FINISH_KEY = key
         logging.info(f"Bound {mode} → {_key_label(key)}")
         save_settings()
     with _binding_lock:
@@ -1871,6 +1898,83 @@ def _cancel_bind() -> None:
         _binding_mode = None
     update_tray()
 
+# ── Open recording (tap to record / pause / resume, finish key submits) ──
+def toggle_recording():
+    """TOGGLE_KEY tap: IDLE → record, recording → pause, paused → resume.
+    No holding — built for long rants you want to pause and come back to.
+    While paused, audio un-ducks and incoming chunks are discarded."""
+    global state, manual_chunks, _toggle_session
+    with state_lock:
+        cur = state
+    if cur in (State.IDLE, State.BUFFERING, State.CHECKING):
+        with state_lock:
+            prev = state
+            state = State.MANUAL
+        update_tray()
+        manual_chunks = []
+        _toggle_session = True
+        if prev in (State.BUFFERING, State.CHECKING):
+            restore_audio()
+        duck_audio()
+        beep_async(PRESS_CHIRP)
+        logging.info("toggle: open recording started")
+    elif cur == State.MANUAL and _toggle_session:
+        with state_lock:
+            state = State.PAUSED
+        update_tray()
+        restore_audio()           # give the room its sound back while paused
+        beep_async(PAUSE_CHIRP)
+        logging.info("toggle: paused")
+    elif cur == State.PAUSED:
+        with state_lock:
+            state = State.MANUAL
+        update_tray()
+        duck_audio()
+        beep_async(PRESS_CHIRP)
+        logging.info("toggle: resumed")
+
+def finish_recording():
+    """FINISH_KEY tap: end the open recording → transcribe → normal pipeline."""
+    global state, manual_chunks, _toggle_session
+    with state_lock:
+        if not _toggle_session or state not in (State.MANUAL, State.PAUSED):
+            return
+        state = State.PROCESSING
+    update_tray()
+    beep_async(RELEASE_CHIRP, then=_delayed_restore)
+    while True:
+        try:
+            manual_chunks.append(audio_q.get_nowait())
+        except queue.Empty:
+            break
+    try:
+        if manual_chunks:
+            audio = np.concatenate(manual_chunks)
+            logging.info(f"toggle: finishing, {len(audio) / SAMPLE_RATE:.1f}s of audio")
+            text = transcribe(audio)
+            if text.strip():
+                logging.info(f"toggle raw: {text}")
+                if not _capture_session and try_voice_command(text):
+                    pass
+                else:
+                    cleaned, press_enter = process_commands(
+                        text, radio="over" if MANUAL_OVER else False)
+                    if cleaned:
+                        cleaned = llm_cleanup(cleaned)
+                    deliver_text(cleaned, press_enter, raw=text)
+            else:
+                logging.info("toggle: no speech detected")
+        else:
+            logging.info("toggle: no audio captured")
+    except Exception:
+        logging.exception("toggle: finish failed")
+    finally:
+        manual_chunks = []
+        _toggle_session = False
+        with state_lock:
+            state = State.IDLE
+        update_tray()
+
 # ── Keyboard handlers ──────────────────────────────────────────────
 _ctrl_down = False   # tracked so Ctrl+<PTT mouse button> chords (e.g. an external
                      # Ctrl+MB5 macro) don't also start a phantom recording
@@ -1893,7 +1997,17 @@ def on_press(key):
             _finish_bind(mode, key)
             return    # don't let the key also trigger its normal action
 
+        if key == TOGGLE_KEY:
+            threading.Thread(target=toggle_recording, daemon=True).start()
+            return
+
+        if key == FINISH_KEY:
+            threading.Thread(target=finish_recording, daemon=True).start()
+            return
+
         if key in (PTT_KEY, CAPTURE_KEY, CAPTURE_STRUCT_KEY):
+            if _toggle_session:
+                return   # an open recording owns the mic — hold-keys can't hijack it
             global _capture_session, _capture_struct
             is_capture = key in (CAPTURE_KEY, CAPTURE_STRUCT_KEY)
             if is_capture and not (CAPTURE_URI or CAPTURE_FILE or CAPTURE_TEXT_URI):
@@ -1964,6 +2078,8 @@ def on_release(key):
                 return
 
         if key in (PTT_KEY, CAPTURE_KEY, CAPTURE_STRUCT_KEY):
+            if _toggle_session:
+                return   # open recordings end via the finish key, not a release
             with state_lock:
                 if state != State.MANUAL:
                     return
@@ -2022,6 +2138,8 @@ def on_click(x, y, button, pressed):
             return    # swallow all clicks while a bind is pending
 
         if button == PTT_MOUSE_BUTTON:
+            if _toggle_session:
+                return   # open recording in progress — mouse PTT stays out of it
             if pressed:
                 if _ctrl_down:
                     # Ctrl+<PTT button> belongs to an external chord macro

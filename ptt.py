@@ -452,6 +452,17 @@ key_sender = keyboard.Controller()
 
 PAUSE_CHIRP = [(587, 70), (587, 70)]   # double mid-tone blip = paused
 
+_last_lockout_beep = 0.0
+
+def _lockout_beep():
+    """Low beep when a PTT key is ignored because an open recording owns the
+    mic — silent lockout reads as a crash. Debounced (key auto-repeat)."""
+    global _last_lockout_beep
+    now = time.time()
+    if now - _last_lockout_beep > 1.0:
+        _last_lockout_beep = now
+        beep_async([(330, 100)])
+
 # ── Device ──────────────────────────────────────────────────────────
 def find_device():
     """DEVICE_NAME may be a single name or a priority-ordered LIST of name
@@ -2039,7 +2050,8 @@ def on_press(key):
 
         if key in (PTT_KEY, CAPTURE_KEY, CAPTURE_STRUCT_KEY):
             if _toggle_session:
-                return   # an open recording owns the mic — hold-keys can't hijack it
+                _lockout_beep()   # audible "open recording active" — silent reads as a crash
+                return
             global _capture_session, _capture_struct
             is_capture = key in (CAPTURE_KEY, CAPTURE_STRUCT_KEY)
             if is_capture and not (CAPTURE_URI or CAPTURE_FILE or CAPTURE_TEXT_URI):
@@ -2171,7 +2183,9 @@ def on_click(x, y, button, pressed):
 
         if button == PTT_MOUSE_BUTTON:
             if _toggle_session:
-                return   # open recording in progress — mouse PTT stays out of it
+                if pressed:
+                    _lockout_beep()   # audible "open recording active"
+                return
             if pressed:
                 if _ctrl_down:
                     # Ctrl+<PTT button> belongs to an external chord macro

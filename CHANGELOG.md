@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-06-22
+
+- **Disable / re-enable switch** (`disable-whisper.ps1` / `enable-whisper.ps1` + tray item
+  + desktop shortcuts): a `.disabled` flag the watchdog now respects, so Whisper can be
+  turned off — freeing the ~4 GB the large-v3 model holds in VRAM — and **stay off** across
+  the 5-min watchdog and reboots until you explicitly re-enable. Tray gains "Disable Whisper
+  (free GPU)" (writes the flag + exits); `enable-whisper.ps1` clears the flag and restarts
+  dictation + the watchdog. Built to work *with* the watchdog instead of fighting it —
+  killing the process alone never stuck because the watchdog revived it within 5 min
+
 ## 2026-06-10 (later)
 
 - **Per-app dictionaries + hot reload + GUI editor**: `app_profiles` entries may carry

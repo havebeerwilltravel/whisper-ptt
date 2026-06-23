@@ -152,6 +152,13 @@ def _button_label(button: mouse.Button) -> str:
 # ── Settings persistence ─────────────────────────────────────────────
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ptt-settings.json")
 
+# Watchdog disable flag — when this file exists, watchdog.ps1 will NOT (re)launch
+# ptt.py and will stop a running instance, freeing the Whisper model from VRAM.
+# Written by the tray "Disable Whisper" item / disable-whisper.ps1; removed by
+# enable-whisper.ps1. Lets you turn Whisper off and keep it off (across the
+# watchdog and reboots) until you explicitly re-enable it.
+DISABLE_FLAG = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".disabled")
+
 _SETTINGS_DEFAULTS = {
     "duck_level": DUCK_LEVEL, "beep_backend": BEEP_BACKEND, "beep_volume": BEEP_VOLUME,
     "device_name": DEVICE_NAME, "model_size": MODEL_SIZE,
@@ -1800,6 +1807,20 @@ def _on_quit(icon, item):
     icon.stop()
     os._exit(0)   # sys.exit() is swallowed by pynput's blocked .join()
 
+def _on_disable(icon, item):
+    """Disable Whisper from the tray: write the watchdog disable flag, then exit.
+    Frees the Whisper model from VRAM and keeps it off — the watchdog sees the
+    flag and won't relaunch ptt.py. Re-enable with enable-whisper.ps1 or the
+    'Enable Whisper' desktop shortcut (the tray is gone once this exits)."""
+    try:
+        with open(DISABLE_FLAG, "w", encoding="utf-8") as f:
+            f.write("disabled via tray " + time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
+        logging.info("Disabled via tray; wrote %s", DISABLE_FLAG)
+    except Exception:
+        logging.exception("could not write disable flag")
+    icon.stop()
+    os._exit(0)
+
 def _get_input_devices():
     return [(i, d["name"]) for i, d in enumerate(sd.query_devices())
             if d["max_input_channels"] > 0]
@@ -1880,6 +1901,7 @@ def build_menu():
         pystray.MenuItem("Hotkeys",      hotkey_items),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Restart PTT", _on_restart),
+        pystray.MenuItem("Disable Whisper (free GPU)", _on_disable),
         pystray.MenuItem("Quit",        _on_quit),
     )
 

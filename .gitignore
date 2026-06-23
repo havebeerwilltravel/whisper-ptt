@@ -13,4 +13,5 @@ dictionary.json
 cleanup-log.jsonl
 dictation-history.jsonl
 watchdog.log
+.disabled
 whisper-ptt.ico

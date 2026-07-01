@@ -2347,7 +2347,30 @@ def run_listener():
                 _restart_event.wait(timeout=0.25)
     return True
 
+def _acquire_single_instance():
+    """Named Windows mutex so two PTT workers never fight over the mic and
+    hotkeys. Auto-released by the OS on process death, so a hard-killed
+    prior run can't leave a stale lock (unlike a lockfile). The venv
+    pythonw shim + Python311 worker pair is ONE logical instance -- only
+    the worker runs main(), so the pair never trips this. Returns the
+    mutex handle (held for process lifetime) or None if another instance
+    already holds it."""
+    import ctypes
+    ERROR_ALREADY_EXISTS = 183
+    handle = ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\WhisperPTT_SingleInstance")
+    if not handle:
+        logging.warning("Single-instance mutex creation failed; continuing unguarded")
+        return handle
+    if ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return None
+    return handle
+
 def main():
+    _instance_mutex = _acquire_single_instance()  # held until process exit
+    if _instance_mutex is None:
+        logging.info("Another PTT instance is already running; exiting")
+        sys.exit(0)
     logging.info("PTT starting")
     start_tray()                  # once; tray outlives run_listener() restarts
     start_indicator()             # once; parks off-screen until recording

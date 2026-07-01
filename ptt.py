@@ -2185,28 +2185,31 @@ def on_release(key):
                 except queue.Empty:
                     break
 
-            if manual_chunks:
-                audio = np.concatenate(manual_chunks)
-                text = transcribe(audio)
-                if text.strip():
-                    logging.info(f"F9 raw: {text}")
-                    if not _capture_session and try_voice_command(text):
-                        pass   # executed (or consumed) a voice command — no paste
+            # try/finally mirrors finish_recording: a transcribe/deliver
+            # exception must never leave the tray wedged in PROCESSING.
+            try:
+                if manual_chunks:
+                    audio = np.concatenate(manual_chunks)
+                    text = transcribe(audio)
+                    if text.strip():
+                        logging.info(f"F9 raw: {text}")
+                        if not _capture_session and try_voice_command(text):
+                            pass   # executed (or consumed) a voice command — no paste
+                        else:
+                            cleaned, press_enter = process_commands(
+                                text, radio="over" if MANUAL_OVER else False)
+                            if cleaned:
+                                cleaned = llm_cleanup(cleaned)
+                            deliver_text(cleaned, press_enter, raw=text)
                     else:
-                        cleaned, press_enter = process_commands(
-                            text, radio="over" if MANUAL_OVER else False)
-                        if cleaned:
-                            cleaned = llm_cleanup(cleaned)
-                        deliver_text(cleaned, press_enter, raw=text)
+                        logging.info("No speech detected")
                 else:
-                    logging.info("No speech detected")
-            else:
-                logging.info("No audio captured")
-
-            manual_chunks = []
-            with state_lock:
-                state = State.IDLE
-            update_tray()
+                    logging.info("No audio captured")
+            finally:
+                manual_chunks = []
+                with state_lock:
+                    state = State.IDLE
+                update_tray()
 
     except Exception as e:
         logging.exception("Error in on_release")
@@ -2275,28 +2278,31 @@ def on_click(x, y, button, pressed):
                     except queue.Empty:
                         break
 
-                if manual_chunks:
-                    audio = np.concatenate(manual_chunks)
-                    text = transcribe(audio)
-                    if text.strip():
-                        logging.info(f"Thumb button raw: {text}")
-                        if not _capture_session and try_voice_command(text):
-                            pass   # executed (or consumed) a voice command — no paste
+                # try/finally mirrors finish_recording: a transcribe/deliver
+                # exception must never leave the tray wedged in PROCESSING.
+                try:
+                    if manual_chunks:
+                        audio = np.concatenate(manual_chunks)
+                        text = transcribe(audio)
+                        if text.strip():
+                            logging.info(f"Thumb button raw: {text}")
+                            if not _capture_session and try_voice_command(text):
+                                pass   # executed (or consumed) a voice command — no paste
+                            else:
+                                cleaned, press_enter = process_commands(
+                                    text, radio="over" if MANUAL_OVER else False)
+                                if cleaned:
+                                    cleaned = llm_cleanup(cleaned)
+                                deliver_text(cleaned, press_enter, raw=text)
                         else:
-                            cleaned, press_enter = process_commands(
-                                text, radio="over" if MANUAL_OVER else False)
-                            if cleaned:
-                                cleaned = llm_cleanup(cleaned)
-                            deliver_text(cleaned, press_enter, raw=text)
+                            logging.info("No speech detected")
                     else:
-                        logging.info("No speech detected")
-                else:
-                    logging.info("No audio captured")
-
-                manual_chunks = []
-                with state_lock:
-                    state = State.IDLE
-                update_tray()
+                        logging.info("No audio captured")
+                finally:
+                    manual_chunks = []
+                    with state_lock:
+                        state = State.IDLE
+                    update_tray()
 
     except Exception as e:
         logging.exception("Error in on_click")

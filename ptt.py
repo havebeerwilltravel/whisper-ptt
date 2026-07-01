@@ -530,7 +530,12 @@ def apply_corrections(text, corrections=None):
     for _pass in range(2):
         before = text
         for source in ordered:
-            text = re.sub(rf'\b{re.escape(source)}\b', corr[source], text, flags=re.IGNORECASE)
+            # Function replacement: not subject to re backslash-escape
+            # processing, so values containing \ (Windows paths, literal
+            # backslashes) paste verbatim instead of crashing (\1) or
+            # corrupting (\b -> backspace).
+            repl = corr[source]
+            text = re.sub(rf'\b{re.escape(source)}\b', lambda m, r=repl: r, text, flags=re.IGNORECASE)
         if text == before:
             break
     return text

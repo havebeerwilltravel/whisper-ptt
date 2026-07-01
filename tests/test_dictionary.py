@@ -68,6 +68,12 @@ check("corrections: whole-word only (no substring hits)",
       "the discount expressway")
 check("corrections: empty text passthrough",
       apply_corrections("", {"a": "b"}), "")
+check("corrections: backslash value pastes literally (no \\b backspace)",
+      apply_corrections("open foo now", {"foo": r"C:\bar"}),
+      r"open C:\bar now")
+check("corrections: numeric group reference in value does not crash",
+      apply_corrections("say foo now", {"foo": r"\1group"}),
+      r"say \1group now")
 
 # ── build_initial_prompt ─────────────────────────────────────────────
 check("prompt: prefix only",

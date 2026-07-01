@@ -1202,13 +1202,21 @@ def _match_voice_command(text, commands, prefix):
     if not words:
         return None, False
 
-    def lookup(phrase, keys):
+    def lookup(phrase, keys, *, strict=False):
         if not phrase:
             return None
         if phrase in keys:
             return commands[keys[phrase]]
+        if strict:
+            # Trigger-word mode (no explicit "command" prefix): EXACT match only.
+            # A bare/partial word must never fire a longer command (saying "lock"
+            # must not run "lock it down"), and a long sentence must never be
+            # swallowed by a short command prefix ("music play the latest idea").
+            return None
         for kl in sorted(keys, key=len, reverse=True):
-            if phrase.startswith(kl) or kl.startswith(phrase):
+            # Classic mode (you said "command …"): allow shorthands, but require a
+            # word boundary so a longer key can't match a partial word.
+            if phrase.startswith(kl + " ") or kl.startswith(phrase):
                 return commands[keys[kl]]
         return None
 
@@ -1223,7 +1231,7 @@ def _match_voice_command(text, commands, prefix):
         family = {k.lower(): k for k in commands
                   if k.split()[0].lower() == words[0]}   # full-phrase keys
         plain = {kl: k for kl, k in family.items() if not kl.endswith(" *")}
-        action = lookup(phrase, plain)
+        action = lookup(phrase, plain, strict=True)
         if action is not None:
             return action, True
         # Parameterized keys: "search google *" captures the remainder as the
@@ -1240,10 +1248,14 @@ def _match_voice_command(text, commands, prefix):
                     # (ClassIT) treat a literal + as part of the search text.
                     return (tmpl.replace("{query}", urllib.parse.quote(remainder, safe=""))
                                 .replace("{raw}", remainder)), True
-        # Near-miss (first two words match a key) → consume, beep, paste nothing.
-        # Anything less is ordinary speech — leave it alone.
+        # Near-miss: the utterance looks like a FLUBBED command — its opening two
+        # words match a command's start AND it isn't much longer than that command
+        # (a garbled tail). Consume + beep, paste nothing. A longer sentence that
+        # merely begins with those words is ordinary speech — leave it alone so we
+        # never swallow real dictation.
         two = " ".join(words[:2])
-        if len(words) >= 2 and any(kl.startswith(two) for kl in family):
+        near = [kl for kl in family if kl.startswith(two)] if len(words) >= 2 else []
+        if near and len(words) <= min(len(kl.split()) for kl in near) + 1:
             return None, True
         return None, False
 
@@ -1968,7 +1980,7 @@ def toggle_recording():
     """TOGGLE_KEY tap: IDLE → record, recording → pause, paused → resume.
     No holding — built for long rants you want to pause and come back to.
     While paused, audio un-ducks and incoming chunks are discarded."""
-    global state, manual_chunks, _toggle_session
+    global state, manual_chunks, _toggle_session, _capture_session, _capture_struct
     with state_lock:
         cur = state
     if cur in (State.IDLE, State.BUFFERING, State.CHECKING):
@@ -1978,6 +1990,10 @@ def toggle_recording():
         update_tray()
         manual_chunks = []
         _toggle_session = True
+        # Open recordings are never capture sessions — declare the kind so a leaked
+        # capture flag can't route the finished text into the note file.
+        _capture_session = False
+        _capture_struct = False
         if prev in (State.BUFFERING, State.CHECKING):
             restore_audio()
         duck_audio()
@@ -2192,7 +2208,7 @@ def on_release(key):
 
 def on_click(x, y, button, pressed):
     """Mouse button handler - the configured PTT mouse button acts as PTT."""
-    global state, manual_chunks
+    global state, manual_chunks, _capture_session, _capture_struct
     try:
         # Binding mode: capture a mouse button as the new PTT button.
         with _binding_lock:
@@ -2223,6 +2239,10 @@ def on_click(x, y, button, pressed):
                     state = State.MANUAL
                 update_tray()
                 manual_chunks = []
+                # Mouse PTT is always a plain dictation — declare the session kind
+                # so a leaked capture flag can't route this paste into the note file.
+                _capture_session = False
+                _capture_struct = False
                 if prev in (State.BUFFERING, State.CHECKING):
                     restore_audio()
                     logging.info("Thumb button interrupted VAD recording")

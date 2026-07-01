@@ -198,9 +198,9 @@ CMDS2 = {"screenshot": "keys:win+shift+s",
 check("voice: full-phrase key defines its own trigger",
       _match_voice_command("Browse to Reddit.", CMDS2, "command"),
       ("run:start chrome https://old.reddit.com/top/", True))
-check("voice: full-phrase partial match",
+check("voice: partial phrase consumed as near-miss, not matched",
       _match_voice_command("browse to red", CMDS2, "command"),
-      ("run:start chrome https://old.reddit.com/top/", True))
+      (None, True))
 check("voice: unknown browse target consumed, no action",
       _match_voice_command("browse to facebook", CMDS2, "command"),
       (None, True))

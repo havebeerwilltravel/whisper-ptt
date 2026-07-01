@@ -458,6 +458,10 @@ _toggle_session = False    # current recording is an open (tap-to-toggle) sessio
 key_sender = keyboard.Controller()
 
 PAUSE_CHIRP = [(587, 70), (587, 70)]   # double mid-tone blip = paused
+MIC_DEAD_CHIRP = [(440, 120), (330, 160)]   # descending A4 → E4 = mic died, recording aborted
+MIC_DEAD_TIMEOUT = 8.0   # s with NO frames at all mid-recording = dead stream (a
+                         # healthy mic delivers frames continuously even in silence,
+                         # so this never trips on a quiet user pausing to think)
 
 _last_lockout_beep = 0.0
 
@@ -1526,8 +1530,10 @@ def start_indicator():
     threading.Thread(target=_indicator_loop, daemon=True, name="indicator").start()
 
 # ── VAD monitor thread ──────────────────────────────────────────────
-def vad_monitor():
-    global state, vad_enabled
+_vad_generation = 0   # bumped by run_listener per restart; stale monitors exit
+
+def vad_monitor(generation):
+    global state, vad_enabled, _toggle_session
 
     vad = vad_model
     vad.reset_states()
@@ -1540,9 +1546,36 @@ def vad_monitor():
     cooldown_until = 0.0  # timestamp: ignore VAD until this time
 
     while True:
+        if generation != _vad_generation:
+            # A restarted run_listener() started a fresh monitor; exit so two
+            # threads never split audio_q between them (chunks would be lost
+            # from recordings and VAD would see gaps).
+            logging.info(f"vad_monitor gen {generation}: superseded, exiting")
+            return
         try:
             chunk = audio_q.get(timeout=0.5)
         except queue.Empty:
+            # Mic-death watch (T2-D): a healthy mic delivers frames
+            # continuously even in dead silence, so "no frames at all for
+            # MIC_DEAD_TIMEOUT during an active recording" means the input
+            # stream died (e.g. DJI Mic Mini auto-power-off) -- not a quiet
+            # user. Abort the recording with feedback instead of letting the
+            # user dictate into a dead stream, and trigger the device
+            # re-scan so the InputStream reopens when the mic returns.
+            with state_lock:
+                recording_dead = (state == State.MANUAL and
+                                  time.time() - last_chunk_time > MIC_DEAD_TIMEOUT)
+            if recording_dead:
+                logging.error(f"mic dead: no audio frames for {MIC_DEAD_TIMEOUT}s "
+                              "during recording -- aborting, rescanning device")
+                with state_lock:
+                    state = State.IDLE
+                manual_chunks.clear()
+                _toggle_session = False
+                update_tray()
+                beep_async(MIC_DEAD_CHIRP, then=_delayed_restore)
+                last_chunk_time = time.time()   # don't re-trip until frames resume
+                _restart_event.set()            # reopen the InputStream
             continue
 
         now = time.time()
@@ -2329,11 +2362,14 @@ def run_listener():
         logging.exception("Failed to load VAD, F9-only mode")
         vad_model = None
 
-    # Start VAD monitor thread
+    # Start VAD monitor thread. Bump the generation so any monitor from a
+    # previous run_listener() exits instead of racing this one for audio_q.
     if vad_model is not None:
-        t = threading.Thread(target=vad_monitor, daemon=True)
+        global _vad_generation
+        _vad_generation += 1
+        t = threading.Thread(target=vad_monitor, args=(_vad_generation,), daemon=True)
         t.start()
-        logging.info("VAD monitor thread started")
+        logging.info(f"VAD monitor thread started (gen {_vad_generation})")
 
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, device=device,
                         callback=audio_callback, blocksize=1600):

@@ -54,14 +54,16 @@ MEETING_INSTRUCTION = (
 
 
 def restructure(text, model, url):
-    body = json.dumps({"model": model, "prompt": MEETING_INSTRUCTION +
-                       f"\n\nTranscript:\n{text}", "stream": False,
-                       "keep_alive": "30m", "options": {"temperature": 0}}).encode()
-    req = urllib.request.Request(f"{url}/api/generate", data=body,
+    # Migrated to llama-swap/llama.cpp OpenAI-compat (was Ollama /api/generate) 2026-07-06.
+    body = json.dumps({"model": model,
+                       "messages": [{"role": "user", "content": MEETING_INSTRUCTION +
+                                     f"\n\nTranscript:\n{text}"}],
+                       "temperature": 0}).encode()
+    req = urllib.request.Request(f"{url}/chat/completions", data=body,
                                  headers={"Content-Type": "application/json"})
     timeout = 30 + len(text) / 100
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())["response"].strip()
+        return json.loads(r.read().decode())["choices"][0]["message"]["content"].strip()
 
 
 def main():
@@ -115,8 +117,8 @@ def main():
         print("restructuring into meeting notes ...")
         try:
             notes = restructure(" ".join(flat),
-                                settings.get("ollama_model", "qwen2.5:14b"),
-                                "http://localhost:11434")
+                                settings.get("ollama_model", "qwen3.5:9b"),
+                                os.environ.get("LOCAL_AI_BASE", "http://127.0.0.1:8080/v1"))
             out_text = (f"# Meeting notes: {title}\n\n{notes}\n\n---\n\n"
                         f"## Full transcript\n\n{body}\n")
         except Exception as e:

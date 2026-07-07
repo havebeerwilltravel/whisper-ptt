@@ -85,10 +85,16 @@ LEXICAL_OVERRIDES = {
 }
 
 # Ollama cleanup pass (optional LLM polish of transcriptions; tray-toggleable)
-OLLAMA_URL = "http://localhost:11434"
-OLLAMA_MODEL = "qwen2.5:14b"
+# Migrated to llama-swap/llama.cpp OpenAI-compat (was native Ollama :11434) 2026-07-06.
+OLLAMA_URL = os.environ.get("LOCAL_AI_BASE", "http://127.0.0.1:8080/v1")
+OLLAMA_MODEL = "qwen3.5:9b"
 OLLAMA_CLEANUP = False           # default off — adds ~0.5-2s latency per dictation
 OLLAMA_TIMEOUT_SECS = 6.0        # on timeout/error we paste the raw transcript instead
+# Allowlist gate (Alex 2026-07-06): cleanup is for EMAIL dictation, not terminal
+# or general dictation. When non-empty, |-separated case-insensitive window-title
+# substrings; cleanup runs ONLY when the focused window matches (raw elsewhere).
+# Empty string = old behavior (cleanup everywhere it isn't profile-skipped).
+CLEANUP_ONLY_WINDOWS = "outlook|message|mail|compose"
 
 # ── Hotkey bindings (overwritten by load_settings at startup) ────────
 PTT_KEY          = keyboard.Key.ctrl_r   # keyboard PTT hold
@@ -171,6 +177,7 @@ _SETTINGS_DEFAULTS = {
     "capture_file": CAPTURE_FILE, "capture_entry": CAPTURE_ENTRY,
     "capture_window_hint": CAPTURE_WINDOW_HINT,
     "ollama_cleanup": OLLAMA_CLEANUP, "ollama_model": OLLAMA_MODEL,
+    "cleanup_only_windows": CLEANUP_ONLY_WINDOWS,
     "indicator": True, "manual_over": MANUAL_OVER,
 }
 
@@ -205,6 +212,7 @@ def save_settings() -> None:
         "capture_file": CAPTURE_FILE, "capture_entry": CAPTURE_ENTRY,
         "capture_window_hint": CAPTURE_WINDOW_HINT,
         "ollama_cleanup": OLLAMA_CLEANUP, "ollama_model": OLLAMA_MODEL,
+        "cleanup_only_windows": CLEANUP_ONLY_WINDOWS,
         "indicator": INDICATOR, "manual_over": MANUAL_OVER,
     }
     tmp = SETTINGS_FILE + ".tmp"
@@ -413,6 +421,7 @@ vad_enabled  = _s["vad_enabled"]
 hot_mic      = _s["hot_mic"]
 OLLAMA_CLEANUP = bool(_s["ollama_cleanup"])
 OLLAMA_MODEL   = _s["ollama_model"]
+CLEANUP_ONLY_WINDOWS = _s["cleanup_only_windows"]
 INDICATOR      = bool(_s["indicator"])
 MANUAL_OVER    = bool(_s["manual_over"])
 CAPTURE_URI         = _s["capture_uri"]
@@ -568,11 +577,18 @@ def transcribe(audio):
 # ── Ollama cleanup pass ──────────────────────────────────────────────
 _OLLAMA_INSTRUCTION = (
     "Fix transcription errors, capitalization, and punctuation in the dictated text. "
-    "Do NOT rephrase, summarize, expand, or add content. NEVER insert words, "
-    "abbreviations, parentheses, or annotations that were not spoken — the vocabulary "
-    "list is for spelling reference only, not for insertion. Capitalize only sentence "
-    "starts and proper nouns; do not capitalize ordinary mid-sentence words. Preserve "
-    "all symbols, slashes, numbers, dollar signs, and line breaks exactly. "
+    "Remove spoken filler ('um', 'uh', 'you know', 'so yeah' as an opener) and "
+    "stutter repeats ('the the', 'to to') — remove ONLY exact filler/repeats, never "
+    "meaningful words. Do NOT rephrase, summarize, expand, or add content. NEVER "
+    "insert words, abbreviations, parentheses, or annotations that were not spoken — "
+    "the vocabulary list is for spelling reference only, not for insertion. "
+    "Capitalize only sentence starts and proper nouns; do not capitalize ordinary "
+    "mid-sentence words. Preserve all symbols, slashes, numbers, dollar signs, and "
+    "line breaks exactly. Numbers: a sequence spoken digit-by-digit (a PRO, phone, "
+    "or tracking number: 'eight eight three seven...') should be written as digits "
+    "(883...7). But NEVER reinterpret quantity words — 'five fifty' stays 'five "
+    "fifty' (it could be 550 or $5.50; you cannot know), no added $ signs or "
+    "decimal points that were not spoken. "
     "Speech-to-text often inserts a period where the speaker merely paused — merge "
     "those fragments back into one sentence. Return ONLY the corrected text.\n"
     "\n"
@@ -580,6 +596,13 @@ _OLLAMA_INSTRUCTION = (
     "And the driver, isaiah, Said the rate stands at $675.\n"
     "Example output: I told the customer we'd email the BOL and label together, "
     "and the driver, Isaiah, said the rate stands at $675.\n"
+    "\n"
+    "Example input: um so the the pickup is at uh three today and its five fifty "
+    "a pallet\n"
+    "Example output: The pickup is at three today and it's five fifty a pallet.\n"
+    "\n"
+    "Example input: the reweigh came back at twelve sixty not eleven hundred\n"
+    "Example output: The reweigh came back at twelve sixty, not eleven hundred.\n"
     "\n"
     "Example input: The Consignee is a hospital dock. so some carriers post-bill "
     "limited access\n"
@@ -625,6 +648,14 @@ def llm_cleanup(text):
         return text
     vocab_hint = ", ".join((_dictionary.get("vocab") or [])[:40])
     window = _active_window_title()
+    # Allowlist gate: cleanup is for email dictation. If configured, only run
+    # when the focused window matches; everywhere else (terminal, notes, chat)
+    # the raw transcript pastes untouched.
+    if CLEANUP_ONLY_WINDOWS.strip():
+        allowed = [s.strip() for s in CLEANUP_ONLY_WINDOWS.lower().split("|") if s.strip()]
+        if not any(s in (window or "").lower() for s in allowed):
+            logging.info(f"ollama: window {window!r} not in cleanup allowlist, raw paste")
+            return text
     profile = _app_profile_for(window, _dictionary.get("app_profiles"))
     style = _profile_style(profile)
     if profile is not None and (profile is False
@@ -643,20 +674,19 @@ def llm_cleanup(text):
     prompt += f"\n\nText: {text}"
     body = json.dumps({
         "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "keep_alive": "30m",
-        "options": {"temperature": 0},
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
     }).encode("utf-8")
     # Long dictations produce proportionally long cleanups — scale the timeout
     # with text length so long-form doesn't silently fall back to raw.
     timeout = OLLAMA_TIMEOUT_SECS + len(text) / 200.0
     t0 = time.time()
     try:
-        req = urllib.request.Request(f"{OLLAMA_URL}/api/generate", data=body,
+        req = urllib.request.Request(f"{OLLAMA_URL}/chat/completions", data=body,
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            out = json.loads(r.read().decode("utf-8")).get("response", "").strip()
+            out = (json.loads(r.read().decode("utf-8"))["choices"][0]["message"]
+                   .get("content") or "").strip()
         logging.info(f"ollama cleanup: {len(text)} chars in {time.time()-t0:.1f}s")
         out = out.strip('"').strip()
         # Guardrail: the model must not rewrite/expand — big length drift means
@@ -1355,18 +1385,17 @@ def llm_restructure(text):
     prompt = _RESTRUCTURE_INSTRUCTION + f"\n\nTranscript: {text}"
     body = json.dumps({
         "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "keep_alive": "30m",
-        "options": {"temperature": 0},
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
     }).encode("utf-8")
     timeout = 10.0 + len(text) / 150.0
     t0 = time.time()
     try:
-        req = urllib.request.Request(f"{OLLAMA_URL}/api/generate", data=body,
+        req = urllib.request.Request(f"{OLLAMA_URL}/chat/completions", data=body,
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            out = json.loads(r.read().decode("utf-8")).get("response", "").strip()
+            out = (json.loads(r.read().decode("utf-8"))["choices"][0]["message"]
+                   .get("content") or "").strip()
         # Restructuring legitimately changes length — only reject the absurd.
         if not out or len(out) > len(text) * 3 + 100 or len(out) < len(text) * 0.25:
             logging.warning("restructure: output failed sanity check, keeping verbatim")

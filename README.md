@@ -277,7 +277,9 @@ If you run [Ollama](https://ollama.com) locally, toggle tray → **Ollama cleanu
 to pipe each transcript through a local LLM that fixes transcription errors,
 casing, and punctuation (strictly no rephrasing — output failing a length sanity
 check is discarded). Configure via `OLLAMA_MODEL` / `OLLAMA_URL` in `ptt.py`
-(default `qwen2.5:14b` on `localhost:11434`; persisted to `ptt-settings.json`).
+(default `qwen3.5:9b` on `localhost:11434`; persisted to `ptt-settings.json`).
+Tip: point it at whatever model you already keep resident in VRAM — a warm
+workhorse model makes the cleanup pass effectively zero cold-load.
 Adds ~0.5–2 s per dictation depending on model and GPU; any error or timeout
 falls back to the raw transcript, so dictation never hangs. Off by default.
 

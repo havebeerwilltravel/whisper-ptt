@@ -1,5 +1,81 @@
 # Changelog
 
+## 2026-06-22
+
+- **Disable / re-enable switch** (`disable-whisper.ps1` / `enable-whisper.ps1` + tray item
+  + desktop shortcuts): a `.disabled` flag the watchdog now respects, so Whisper can be
+  turned off — freeing the ~4 GB the large-v3 model holds in VRAM — and **stay off** across
+  the 5-min watchdog and reboots until you explicitly re-enable. Tray gains "Disable Whisper
+  (free GPU)" (writes the flag + exits); `enable-whisper.ps1` clears the flag and restarts
+  dictation + the watchdog. Built to work *with* the watchdog instead of fighting it —
+  killing the process alone never stuck because the watchdog revived it within 5 min
+
+## 2026-06-10 (later)
+
+- **Per-app dictionaries + hot reload + GUI editor**: `app_profiles` entries may carry
+  per-app `vocab`/`corrections` alongside `style`; dictionary.json hot-reloads on mtime
+  before every transcription; `dictionary_editor.py` (tray → Dictionary → Edit) edits
+  vocab and corrections with a Global/per-app scope picker
+- **Trailing "over" presses Enter** in manual PTT (`manual_over`, tray toggle, off by
+  default): hands-free send; final-word-only, other radio commands stay VAD-only
+- **Voice commands** (`voice_commands` in dictionary.json): `keys:`/`run:`/`open:`
+  actions; classic prefix keys ("command screenshot"), full-phrase keys that define
+  their own trigger ("browse to reddit"), and wildcard query capture ("search google *"
+  → executed search, {query} percent-encoded). Deterministic lookup, no LLM execution
+- **transcribe_file.py**: offline file transcription (same model/dictionary/prompt as
+  live dictation); `--structured` produces meeting notes via Ollama
+- **Mic priority list**: `device_name` accepts an ordered list of name substrings;
+  first present wins (lapel mic when plugged in, desk mic fallback)
+- Ctrl+<PTT mouse button> chords are ignored (external chord macros don't trigger
+  phantom recordings); cleanup prompt hardened from live calibration (no insertions,
+  no stray mid-sentence caps, length-scaled timeout); cleanup pairs + all dictations
+  logged locally (cleanup-log.jsonl, dictation-history.jsonl)
+
+## 2026-06-10
+
+- **Undo last teach** (tray → Dictionary): teach events are recorded to `_teach_history`
+  in dictionary.json (last 20) and the newest can be reverted — corrections and any vocab
+  it added — so one bad learn can't silently poison future dictations
+- **Re-paste key** (F16, rebindable): re-pastes the last transcript at the current focus,
+  for when a dialog or focus change ate the original paste. Every manual dictation is now
+  logged to `dictation-history.jsonl` (raw, final, mode, window; machine-local)
+- **Structured capture key** (F17, rebindable): like the capture key, but the transcript is
+  restructured by the local LLM into concise markdown bullets with `- [ ]` action items
+  before it lands in the note; verbatim fallback if Ollama is unreachable
+- **Recording indicator**: always-on-top speech-wave bubble near the cursor — bars follow
+  live mic level while recording, orange pulse while transcribing. Parks off-screen instead
+  of unmapping so it can never steal focus from the paste target. Tray-toggleable
+- **watchdog.ps1**: auto-start at logon + self-heal (relaunches ptt.py within 5 min if the
+  process dies); run from a `shell:startup` shortcut, hidden window
+- Per-app style profiles (2026-06-09 late): `app_profiles` in dictionary.json maps window-
+  title substrings to style instructions for the cleanup pass; `"skip"` bypasses the LLM
+  entirely (terminals). Capture delivery moved to silent direct file-append (`capture_file`)
+  after the URI-open flow stole focus mid-dictation
+
+## 2026-06-09
+
+- **Managed dictionary**: vocab + corrections move from in-code constants to
+  `dictionary.json` (auto-created on first run from the legacy `INITIAL_PROMPT` /
+  `LEXICAL_OVERRIDES`, so behavior is unchanged until edited; machine-local, gitignored;
+  `dictionary.example.json` documents the schema). Whisper's prompt is built from
+  `prompt_prefix` + `vocab` and trimmed to a ~200-token budget from the tail so the most
+  important terms always survive. Corrections are case-insensitive whole-word replacements,
+  multi-word keys supported, longest key wins. Tray → **Dictionary** submenu: teach from
+  selection, reload without restart, open the file, live vocab/correction counts
+- **Teach mode** (F7, rebindable via tray → Hotkeys): fix a dictation where it was pasted,
+  select the corrected text, press the teach key — the script diffs the selection against
+  the last injected transcript, learns the changed word pairs into `corrections`, and adds
+  new proper nouns to `vocab`. Only small word-level replacements are learned; insertions/
+  deletions are content edits, and plain sentence capitalization is ignored so common words
+  are never over-learned. Success = rising arpeggio, nothing-learned = single low beep
+- **Ollama cleanup pass** (optional, off by default, tray-toggleable): pipes each transcript
+  through a local Ollama model (`qwen2.5:14b` default) to fix casing/punctuation with a
+  strict no-rephrasing instruction, dictionary vocab as spelling hints, temperature 0, a
+  hard 6 s timeout, and a length sanity check — any failure falls back to the raw transcript
+  so dictation never hangs. Persisted as `ollama_cleanup` / `ollama_model` in settings
+- Tests: `tests/test_dictionary.py` covers the corrections/prompt/teach-diff pipeline via
+  AST extraction (runs without torch/pynput installed): `python tests/test_dictionary.py`
+
 ## 2026-06-03 (later)
 
 - Audio sessions are now matched by their Windows session-instance id instead of by list

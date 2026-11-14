@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+.venv/
 # Agent docs & secrets
 CLAUDE.md
 CLAUDE.local.md
@@ -8,4 +9,9 @@ GEMINI.md
 .env.*
 # Machine-local runtime config & generated assets
 ptt-settings.json
+dictionary.json
+cleanup-log.jsonl
+dictation-history.jsonl
+watchdog.log
+.disabled
 whisper-ptt.ico

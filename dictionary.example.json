@@ -1,0 +1,20 @@
+{
+  "prompt_prefix": "Work dictation about software and logistics.",
+  "vocab": [
+    "Ollama",
+    "qwen2.5",
+    "faster-whisper",
+    "InXpress",
+    "NMFC"
+  ],
+  "corrections": {
+    "oh llama": "Ollama",
+    "in express": "InXpress",
+    "cis": "sys"
+  },
+  "app_profiles": {
+    "outlook|gmail": "This is an email. Complete sentences, short paragraphs.",
+    "discord|slack": "This is a chat message. Casual and loose; fragments are fine.",
+    "windows terminal|powershell|cmd|wsl": "skip"
+  }
+}

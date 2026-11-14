@@ -20,6 +20,9 @@ import threading
 import queue
 import re
 import json
+import difflib
+import urllib.request
+import urllib.parse
 from enum import Enum
 import winsound
 
@@ -68,6 +71,9 @@ TERMINAL_TITLE_HINTS = (
 )
 
 WAKE_PHRASE = "send it"
+MANUAL_OVER = False   # opt-in: ending a manual-PTT dictation with "over" presses Enter
+COMMAND_PREFIX = "command"   # dictations starting with this word run voice_commands
+                             # from dictionary.json instead of pasting text
 VAD_THRESHOLD = 0.5
 SILENCE_CHECK_SECS = 2.0    # silence before checking for "over"/"disregard"
 MAX_DICTATION_SECS = 300.0  # 5 min safety timeout
@@ -78,11 +84,46 @@ LEXICAL_OVERRIDES = {
     "ray": "Rei",
 }
 
+# Ollama cleanup pass (optional LLM polish of transcriptions; tray-toggleable)
+# Migrated to llama-swap/llama.cpp OpenAI-compat (was native Ollama :11434) 2026-07-06.
+OLLAMA_URL = os.environ.get("LOCAL_AI_BASE", "http://127.0.0.1:8080/v1")
+OLLAMA_MODEL = "qwen3.5:9b"
+OLLAMA_CLEANUP = False           # default off — adds ~0.5-2s latency per dictation
+OLLAMA_TIMEOUT_SECS = 6.0        # on timeout/error we paste the raw transcript instead
+# Allowlist gate (Alex 2026-07-06): cleanup is for EMAIL dictation, not terminal
+# or general dictation. When non-empty, |-separated case-insensitive window-title
+# substrings; cleanup runs ONLY when the focused window matches (raw elsewhere).
+# Empty string = old behavior (cleanup everywhere it isn't profile-skipped).
+CLEANUP_ONLY_WINDOWS = "outlook|message|mail|compose"
+
 # ── Hotkey bindings (overwritten by load_settings at startup) ────────
 PTT_KEY          = keyboard.Key.ctrl_r   # keyboard PTT hold
 HOT_MIC_KEY      = keyboard.Key.f10      # toggle hot mic
 VAD_KEY          = keyboard.Key.f8       # toggle VAD
+TEACH_KEY        = keyboard.Key.f7       # learn corrections from selected fixed text
+CAPTURE_KEY      = keyboard.Key.f15      # note-capture PTT: silent append to your note
+REPASTE_KEY      = keyboard.Key.f16      # re-paste the last transcript at current focus
+CAPTURE_STRUCT_KEY = keyboard.Key.f17    # like capture, but the ramble is restructured
+                                         # into bullets/action items before it lands
+TOGGLE_KEY       = keyboard.Key.f18      # tap: start / pause / resume an open recording
+FINISH_KEY       = keyboard.Key.f19      # tap: finish the open recording → transcribe & paste
 PTT_MOUSE_BUTTON = mouse.Button.x2       # mouse PTT hold (front thumb button)
+
+# Note-capture: hold CAPTURE_KEY, talk, release — the transcript is delivered
+# to your note WITHOUT touching the screen. Delivery modes (first set wins):
+#   CAPTURE_FILE — append CAPTURE_ENTRY directly to a file path template.
+#     Completely silent: no window opens, no focus moves (a note app like
+#     Obsidian live-reloads the file). Preferred.
+#   CAPTURE_TEXT_URI — deliver via a URI handler ({text} placeholder,
+#     URL-encoded). The handler app will usually raise its window.
+#   neither — fall back to a normal clipboard paste at the cursor.
+# CAPTURE_URI optionally opens a URI on PRESS (visual feedback) — empty skips.
+# {date}/{time}/{text} are substituted in all templates.
+CAPTURE_URI = ""
+CAPTURE_TEXT_URI = ""
+CAPTURE_FILE = ""          # e.g. C:\\vault\\Quick Notes\\{date}.md
+CAPTURE_ENTRY = "\n\n## {time}\n{text}\n"
+CAPTURE_WINDOW_HINT = ""   # window-title substring to focus after press-open (best-effort)
 
 def _key_to_str(key: keyboard.Key | keyboard.KeyCode) -> str:
     """Serialize a pynput key to a JSON-safe string."""
@@ -117,11 +158,27 @@ def _button_label(button: mouse.Button) -> str:
 # ── Settings persistence ─────────────────────────────────────────────
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ptt-settings.json")
 
+# Watchdog disable flag — when this file exists, watchdog.ps1 will NOT (re)launch
+# ptt.py and will stop a running instance, freeing the Whisper model from VRAM.
+# Written by the tray "Disable Whisper" item / disable-whisper.ps1; removed by
+# enable-whisper.ps1. Lets you turn Whisper off and keep it off (across the
+# watchdog and reboots) until you explicitly re-enable it.
+DISABLE_FLAG = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".disabled")
+
 _SETTINGS_DEFAULTS = {
     "duck_level": DUCK_LEVEL, "beep_backend": BEEP_BACKEND, "beep_volume": BEEP_VOLUME,
-    "device_name": DEVICE_NAME, "vad_enabled": False, "hot_mic": False,
-    "ptt_key": "ctrl_r", "hot_mic_key": "f10", "vad_key": "f8",
+    "device_name": DEVICE_NAME, "model_size": MODEL_SIZE,
+    "vad_enabled": False, "hot_mic": False,
+    "ptt_key": "ctrl_r", "hot_mic_key": "f10", "vad_key": "f8", "teach_key": "f7",
+    "capture_key": "f15", "repaste_key": "f16", "capture_struct_key": "f17",
+    "toggle_key": "f18", "finish_key": "f19",
     "ptt_mouse_button": "x2",
+    "capture_uri": CAPTURE_URI, "capture_text_uri": CAPTURE_TEXT_URI,
+    "capture_file": CAPTURE_FILE, "capture_entry": CAPTURE_ENTRY,
+    "capture_window_hint": CAPTURE_WINDOW_HINT,
+    "ollama_cleanup": OLLAMA_CLEANUP, "ollama_model": OLLAMA_MODEL,
+    "cleanup_only_windows": CLEANUP_ONLY_WINDOWS,
+    "indicator": True, "manual_over": MANUAL_OVER,
 }
 
 def load_settings() -> dict:
@@ -139,11 +196,24 @@ def load_settings() -> dict:
 def save_settings() -> None:
     data = {
         "duck_level": DUCK_LEVEL, "beep_backend": BEEP_BACKEND, "beep_volume": BEEP_VOLUME,
-        "device_name": DEVICE_NAME, "vad_enabled": vad_enabled, "hot_mic": hot_mic,
+        "device_name": DEVICE_NAME, "model_size": MODEL_SIZE,
+        "vad_enabled": vad_enabled, "hot_mic": hot_mic,
         "ptt_key": _key_to_str(PTT_KEY),
         "hot_mic_key": _key_to_str(HOT_MIC_KEY),
         "vad_key": _key_to_str(VAD_KEY),
+        "teach_key": _key_to_str(TEACH_KEY),
+        "capture_key": _key_to_str(CAPTURE_KEY),
+        "repaste_key": _key_to_str(REPASTE_KEY),
+        "capture_struct_key": _key_to_str(CAPTURE_STRUCT_KEY),
+        "toggle_key": _key_to_str(TOGGLE_KEY),
+        "finish_key": _key_to_str(FINISH_KEY),
         "ptt_mouse_button": _button_to_str(PTT_MOUSE_BUTTON),
+        "capture_uri": CAPTURE_URI, "capture_text_uri": CAPTURE_TEXT_URI,
+        "capture_file": CAPTURE_FILE, "capture_entry": CAPTURE_ENTRY,
+        "capture_window_hint": CAPTURE_WINDOW_HINT,
+        "ollama_cleanup": OLLAMA_CLEANUP, "ollama_model": OLLAMA_MODEL,
+        "cleanup_only_windows": CLEANUP_ONLY_WINDOWS,
+        "indicator": INDICATOR, "manual_over": MANUAL_OVER,
     }
     tmp = SETTINGS_FILE + ".tmp"
     try:
@@ -153,6 +223,114 @@ def save_settings() -> None:
     except Exception:
         logging.exception("save_settings failed")
 
+# ── Managed dictionary (vocab + corrections) ─────────────────────────
+# dictionary.json next to ptt.py:
+#   prompt_prefix — free-text context fed to Whisper before the vocab list
+#   vocab         — terms Whisper should recognize (ordered most-important first;
+#                   trimmed from the end if the prompt budget is exceeded)
+#   corrections   — {"misheard phrase": "Correct Form"} applied to every transcript
+# Created from the in-code defaults on first run. Machine-local (gitignored).
+DICT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dictionary.json")
+PROMPT_TOKEN_BUDGET = 200   # whisper conditions on the last ~224 prompt tokens; stay under
+                            # so the prefix is never silently pushed out of the window
+
+_dictionary = {"prompt_prefix": "", "vocab": [], "corrections": {}}
+EFFECTIVE_PROMPT = INITIAL_PROMPT
+
+def _default_dictionary():
+    """First-run migration: preserve the legacy in-code INITIAL_PROMPT and
+    LEXICAL_OVERRIDES so behavior is unchanged until the user edits the file."""
+    return {
+        "prompt_prefix": INITIAL_PROMPT,
+        "vocab": [],
+        "corrections": dict(LEXICAL_OVERRIDES),
+    }
+
+def build_initial_prompt(d):
+    vocab = list(dict.fromkeys(d.get("vocab") or []))   # dedupe, keep order
+    prefix = (d.get("prompt_prefix") or "").strip()
+
+    def render(words):
+        parts = [prefix] if prefix else []
+        if words:
+            parts.append("Vocabulary: " + ", ".join(words) + ".")
+        return " ".join(parts)
+
+    prompt = render(vocab)
+    while vocab and len(prompt) // 3 > PROMPT_TOKEN_BUDGET:   # ~3 chars/token heuristic
+        vocab.pop()
+        prompt = render(vocab)
+    if len(prompt) // 3 > PROMPT_TOKEN_BUDGET:
+        logging.warning("dictionary: prompt_prefix alone exceeds the prompt budget")
+    return prompt
+
+def load_dictionary():
+    global _dictionary, EFFECTIVE_PROMPT, _dict_mtime
+    try:
+        with open(DICT_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        _dict_mtime = os.path.getmtime(DICT_FILE)
+    except FileNotFoundError:
+        d = _default_dictionary()
+        try:
+            with open(DICT_FILE, "w", encoding="utf-8") as f:
+                json.dump(d, f, indent=2, ensure_ascii=False)
+            logging.info(f"dictionary: created {DICT_FILE} from in-code defaults")
+        except Exception:
+            logging.exception("dictionary: could not write default file")
+    except Exception:
+        logging.exception("dictionary: load failed, using in-code defaults")
+        d = _default_dictionary()
+    if not isinstance(d, dict):
+        d = _default_dictionary()
+    d.setdefault("prompt_prefix", "")
+    d.setdefault("vocab", [])
+    d.setdefault("corrections", {})
+    d.setdefault("app_profiles", {})
+    d.setdefault("voice_commands", {})   # "phrase": "keys:..." | "run:..." | "open:..."
+    d.setdefault("_teach_history", [])   # last N teach events, for undo
+    _dictionary = d
+    EFFECTIVE_PROMPT = build_initial_prompt(d)
+    logging.info(f"dictionary: {len(d['vocab'])} vocab terms, "
+                 f"{len(d['corrections'])} corrections")
+    return d
+
+def save_dictionary():
+    global _dict_mtime
+    tmp = DICT_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_dictionary, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, DICT_FILE)
+        _dict_mtime = os.path.getmtime(DICT_FILE)
+    except Exception:
+        logging.exception("save_dictionary failed")
+
+_dict_mtime = 0.0
+
+def _maybe_reload_dictionary():
+    """Hot-reload: if dictionary.json changed on disk (GUI editor, manual edit,
+    another tool), pick it up before the next transcription."""
+    global _dict_mtime
+    try:
+        m = os.path.getmtime(DICT_FILE)
+    except OSError:
+        return
+    if m != _dict_mtime:
+        _dict_mtime = m
+        load_dictionary()
+        logging.info("dictionary: hot-reloaded (file changed on disk)")
+
+# App profiles may be a plain string (style instruction) or an object with
+# optional per-app extensions: {"style": ..., "vocab": [...], "corrections": {...}}
+def _profile_field(profile, key, default=None):
+    return profile.get(key, default) if isinstance(profile, dict) else default
+
+def _profile_style(profile):
+    if isinstance(profile, str):
+        return profile
+    return _profile_field(profile, "style", "") or ""
+
 # ── State machine ───────────────────────────────────────────────────
 class State(Enum):
     IDLE = 0
@@ -160,6 +338,7 @@ class State(Enum):
     CHECKING = 2     # silence gap, transcribing to check for over/disregard
     PROCESSING = 4   # transcribing F9 recording
     MANUAL = 5       # F9 held down
+    PAUSED = 6       # open (toggle) recording paused — audio discarded until resume
 
 state = State.IDLE
 state_lock = threading.Lock()
@@ -237,12 +416,29 @@ DUCK_LEVEL   = _s["duck_level"]
 BEEP_BACKEND = _s["beep_backend"]
 BEEP_VOLUME  = _s["beep_volume"]
 DEVICE_NAME  = _s["device_name"]
+MODEL_SIZE   = _s["model_size"]
 vad_enabled  = _s["vad_enabled"]
 hot_mic      = _s["hot_mic"]
+OLLAMA_CLEANUP = bool(_s["ollama_cleanup"])
+OLLAMA_MODEL   = _s["ollama_model"]
+CLEANUP_ONLY_WINDOWS = _s["cleanup_only_windows"]
+INDICATOR      = bool(_s["indicator"])
+MANUAL_OVER    = bool(_s["manual_over"])
+CAPTURE_URI         = _s["capture_uri"]
+CAPTURE_TEXT_URI    = _s["capture_text_uri"]
+CAPTURE_FILE        = _s["capture_file"]
+CAPTURE_ENTRY       = _s["capture_entry"]
+CAPTURE_WINDOW_HINT = _s["capture_window_hint"]
 for _attr, _setting, _default in [
     ("PTT_KEY",     "ptt_key",     keyboard.Key.ctrl_r),
     ("HOT_MIC_KEY", "hot_mic_key", keyboard.Key.f10),
     ("VAD_KEY",     "vad_key",     keyboard.Key.f8),
+    ("TEACH_KEY",   "teach_key",   keyboard.Key.f7),
+    ("CAPTURE_KEY", "capture_key", keyboard.Key.f15),
+    ("REPASTE_KEY", "repaste_key", keyboard.Key.f16),
+    ("CAPTURE_STRUCT_KEY", "capture_struct_key", keyboard.Key.f17),
+    ("TOGGLE_KEY", "toggle_key", keyboard.Key.f18),
+    ("FINISH_KEY", "finish_key", keyboard.Key.f19),
 ]:
     try:
         globals()[_attr] = _str_to_key(_s[_setting])
@@ -252,6 +448,8 @@ try:
     PTT_MOUSE_BUTTON = _str_to_button(_s["ptt_mouse_button"])
 except (KeyError, AttributeError):
     PTT_MOUSE_BUTTON = mouse.Button.x2
+
+load_dictionary()   # builds EFFECTIVE_PROMPT; creates dictionary.json on first run
 
 # ── Globals ─────────────────────────────────────────────────────────
 whisper_model = None
@@ -263,14 +461,104 @@ RESTORE_DELAY = 0.12           # seconds after the release beep before un-duckin
 _VOL_TOLERANCE = 0.02          # treat a session within this of its target as restored
 _RESTORE_VERIFY_PASSES = 4     # re-check/re-apply restored volumes up to this many times
 manual_chunks = []  # chunks collected during F9 hold
+_capture_session = False   # current manual recording was started by a capture key
+_capture_struct = False    # ...by the STRUCTURED capture key specifically
+_toggle_session = False    # current recording is an open (tap-to-toggle) session
 key_sender = keyboard.Controller()
 
+PAUSE_CHIRP = [(587, 70), (587, 70)]   # double mid-tone blip = paused
+MIC_DEAD_CHIRP = [(440, 120), (330, 160)]   # descending A4 → E4 = mic died, recording aborted
+MIC_DEAD_TIMEOUT = 8.0   # s with NO frames at all mid-recording = dead stream (a
+                         # healthy mic delivers frames continuously even in silence,
+                         # so this never trips on a quiet user pausing to think)
+
+_last_lockout_beep = 0.0
+
+def _lockout_beep():
+    """Low beep when a PTT key is ignored because an open recording owns the
+    mic — silent lockout reads as a crash. Debounced (key auto-repeat)."""
+    global _last_lockout_beep
+    now = time.time()
+    if now - _last_lockout_beep > 1.0:
+        _last_lockout_beep = now
+        beep_async([(330, 100)])
+
 # ── Device ──────────────────────────────────────────────────────────
+# Liveness-probed priority selection (design traded from Nick Jones 2026-07-13).
+# DEVICE_NAME is a priority pin list; instead of picking by PRESENCE, each
+# candidate pin is probed for actual audio FRAME FLOW (not amplitude — a healthy
+# mic delivers frames continuously even in silence) before it is selected. A
+# present-but-dead pin (e.g. a Bluetooth-multipoint headset whose HFP link is
+# held by another host) falls through to the next pin instead of hanging PTT.
+# Dead/alive verdicts are cached by device name so retry loops fail fast on a
+# known-dead pin; the probe costs ~400ms only on the first open of an outage.
+_PROBE_TIMEOUT = 0.4          # s to wait for the first audio frame
+_ALIVE_TTL = 10.0             # trust an alive verdict across immediate restart churn
+_DEAD_TTL = 20.0              # skip probing a known-dead pin this long, then re-check
+_mic_alive_cache = {}         # device name -> ts last proven alive
+_mic_dead_cache = {}          # device name -> ts last proven dead
+_active_device_name = None    # name of the device the live InputStream is on
+
+def _mark_device_dead(name):
+    """Stamp a pin dead (mic-death watch calls this when the live stream stops
+    delivering frames) so the restart's find_device() falls through past it."""
+    if name:
+        _mic_dead_cache[name] = time.time()
+        _mic_alive_cache.pop(name, None)
+
+def _probe_frames_flow(index, name):
+    """True iff the device actually delivers audio frames — opens a short
+    throwaway InputStream and waits for the first callback. Frames-flow, not
+    amplitude: silence still produces frames on a healthy mic."""
+    got_frames = threading.Event()
+
+    def _cb(indata, frames, t, status):
+        if frames:
+            got_frames.set()
+
+    t0 = time.time()
+    try:
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, device=index,
+                            callback=_cb, blocksize=VAD_CHUNK):
+            alive = got_frames.wait(_PROBE_TIMEOUT)
+    except Exception as e:
+        logging.warning(f"liveness probe: open failed for {name!r}: {e}")
+        alive = False
+    now = time.time()
+    if alive:
+        _mic_alive_cache[name] = now
+        _mic_dead_cache.pop(name, None)
+    else:
+        _mic_dead_cache[name] = now
+        _mic_alive_cache.pop(name, None)
+    logging.info(f"liveness probe: {name!r} -> {'alive' if alive else 'DEAD'} "
+                 f"({time.time() - t0:.2f}s)")
+    return alive
+
 def find_device():
+    """DEVICE_NAME may be a single name or a priority-ordered LIST of name
+    substrings. Walks the pin list in order and returns the first PRESENT
+    device that passes the frames-flow liveness probe; known-dead pins
+    (dead cache, _DEAD_TTL) are skipped without re-probing. Returns
+    None if no pin is alive. After plugging/unplugging a mic, use
+    tray → Restart PTT to re-run the pick."""
+    names = DEVICE_NAME if isinstance(DEVICE_NAME, list) else [DEVICE_NAME]
     devices = sd.query_devices()
-    for i, d in enumerate(devices):
-        if DEVICE_NAME.lower() in d['name'].lower() and d['max_input_channels'] > 0:
-            return i
+    now = time.time()
+    for name in names:
+        for i, d in enumerate(devices):
+            if name.lower() not in d['name'].lower() or d['max_input_channels'] <= 0:
+                continue
+            dev_name = d['name']
+            if now - _mic_dead_cache.get(dev_name, 0) < _DEAD_TTL:
+                logging.info(f"find_device: {dev_name!r} in dead cache, falling through")
+                continue
+            if now - _mic_alive_cache.get(dev_name, 0) < _ALIVE_TTL:
+                return i
+            if _probe_frames_flow(i, dev_name):
+                return i
+            # present but no frames flowing (BT-multipoint held elsewhere,
+            # powered-off wireless receiver) — fall through to the next pin
     return None
 
 # ── Models ──────────────────────────────────────────────────────────
@@ -306,20 +594,177 @@ def load_whisper():
     logging.error("All whisper compute types failed")
     raise last_err
 
-def apply_lexical_overrides(text):
-    """Force preferred token replacements on Whisper output."""
+def apply_corrections(text, corrections=None):
+    """Force preferred replacements on Whisper output (case-insensitive,
+    whole-word, multi-word keys supported). Longest keys first so
+    "us web ship" wins over "web ship". Applied twice: a single-word fix
+    (velmunt→Velmont) can make a multi-word key match on the second pass
+    ("velmont discount products"→"Velmont Discount Products")."""
     if not text:
         return text
-    for source, target in LEXICAL_OVERRIDES.items():
-        text = re.sub(rf'\b{re.escape(source)}\b', target, text, flags=re.IGNORECASE)
+    corr = corrections if corrections is not None else _dictionary.get("corrections") or {}
+    ordered = sorted(corr, key=len, reverse=True)
+    for _pass in range(2):
+        before = text
+        for source in ordered:
+            # Function replacement: not subject to re backslash-escape
+            # processing, so values containing \ (Windows paths, literal
+            # backslashes) paste verbatim instead of crashing (\1) or
+            # corrupting (\b -> backspace).
+            repl = corr[source]
+            text = re.sub(rf'\b{re.escape(source)}\b', lambda m, r=repl: r, text, flags=re.IGNORECASE)
+        if text == before:
+            break
     return text
 
 def transcribe(audio):
+    _maybe_reload_dictionary()
+    # Per-app dictionary: the focused window's profile can extend the global
+    # vocab (prompt) and corrections for this transcription only.
+    window = _active_window_title()
+    profile = _app_profile_for(window, _dictionary.get("app_profiles"))
+    prompt = EFFECTIVE_PROMPT
+    app_vocab = _profile_field(profile, "vocab") or []
+    if app_vocab:
+        prompt = build_initial_prompt({
+            "prompt_prefix": _dictionary.get("prompt_prefix", ""),
+            "vocab": list(app_vocab) + list(_dictionary.get("vocab") or []),
+        })
     m = load_whisper()
     segments, _ = m.transcribe(audio, language="en", beam_size=5, vad_filter=True,
-                                initial_prompt=INITIAL_PROMPT)
+                                initial_prompt=prompt)
     text = " ".join(seg.text.strip() for seg in segments)
-    return apply_lexical_overrides(text)
+    corr = dict(_dictionary.get("corrections") or {})
+    corr.update(_profile_field(profile, "corrections") or {})   # app wins on clash
+    return apply_corrections(text, corr)
+
+# ── Ollama cleanup pass ──────────────────────────────────────────────
+_OLLAMA_INSTRUCTION = (
+    "Fix transcription errors, capitalization, and punctuation in the dictated text. "
+    "Remove spoken filler ('um', 'uh', 'you know', 'so yeah' as an opener) and "
+    "stutter repeats ('the the', 'to to') — remove ONLY exact filler/repeats, never "
+    "meaningful words. Do NOT rephrase, summarize, expand, or add content. NEVER "
+    "insert words, abbreviations, parentheses, or annotations that were not spoken — "
+    "the vocabulary list is for spelling reference only, not for insertion. "
+    "Capitalize only sentence starts and proper nouns; do not capitalize ordinary "
+    "mid-sentence words. Preserve all symbols, slashes, numbers, dollar signs, and "
+    "line breaks exactly. Numbers: a sequence spoken digit-by-digit (a PRO, phone, "
+    "or tracking number: 'eight eight three seven...') should be written as digits "
+    "(883...7). But NEVER reinterpret quantity words — 'five fifty' stays 'five "
+    "fifty' (it could be 550 or $5.50; you cannot know), no added $ signs or "
+    "decimal points that were not spoken. "
+    "Speech-to-text often inserts a period where the speaker merely paused — merge "
+    "those fragments back into one sentence. Return ONLY the corrected text.\n"
+    "\n"
+    "Example input: I told the customer we'd email the BOL and label. Together. "
+    "And the driver, isaiah, Said the rate stands at $675.\n"
+    "Example output: I told the customer we'd email the BOL and label together, "
+    "and the driver, Isaiah, said the rate stands at $675.\n"
+    "\n"
+    "Example input: um so the the pickup is at uh three today and its five fifty "
+    "a pallet\n"
+    "Example output: The pickup is at three today and it's five fifty a pallet.\n"
+    "\n"
+    "Example input: the reweigh came back at twelve sixty not eleven hundred\n"
+    "Example output: The reweigh came back at twelve sixty, not eleven hundred.\n"
+    "\n"
+    "Example input: The Consignee is a hospital dock. so some carriers post-bill "
+    "limited access\n"
+    "Example output: The consignee is a hospital dock, so some carriers post-bill "
+    "limited access."
+)
+
+def _app_profile_for(title, profiles):
+    """Match a window title against app_profiles keys. Keys are |-separated
+    case-insensitive title substrings ("outlook", "powershell|cmd|wsl").
+    First matching profile (insertion order) wins; None if no match."""
+    t = (title or "").lower()
+    if not t:
+        return None
+    for key, instruction in (profiles or {}).items():
+        for alt in key.split("|"):
+            alt = alt.strip().lower()
+            if alt and alt in t:
+                return instruction
+    return None
+
+_CLEANUP_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cleanup-log.jsonl")
+
+def _log_cleanup_pair(raw, cleaned, model, duration, window):
+    """Append a (raw → cleaned) pair for later prompt refinement / tuning.
+    Local file, audit + future fine-tune corpus."""
+    try:
+        with open(_CLEANUP_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "window": window, "model": model,
+                "duration_s": round(duration, 2),
+                "raw": raw, "cleaned": cleaned,
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        logging.exception("cleanup pair log failed")
+
+def llm_cleanup(text):
+    """Optional local-LLM polish via Ollama. Hard timeout; any failure returns
+    the raw transcript so dictation never hangs on a cold/slow model (a timed-out
+    request still warms the model server-side for the next one)."""
+    if not OLLAMA_CLEANUP or not text or not text.strip():
+        return text
+    vocab_hint = ", ".join((_dictionary.get("vocab") or [])[:40])
+    window = _active_window_title()
+    # Allowlist gate: cleanup is for email dictation. If configured, only run
+    # when the focused window matches; everywhere else (terminal, notes, chat)
+    # the raw transcript pastes untouched.
+    if CLEANUP_ONLY_WINDOWS.strip():
+        allowed = [s.strip() for s in CLEANUP_ONLY_WINDOWS.lower().split("|") if s.strip()]
+        if not any(s in (window or "").lower() for s in allowed):
+            logging.info(f"ollama: window {window!r} not in cleanup allowlist, raw paste")
+            return text
+    profile = _app_profile_for(window, _dictionary.get("app_profiles"))
+    style = _profile_style(profile)
+    if profile is not None and (profile is False
+                                or style.strip().lower() in ("skip", "off", "raw")):
+        logging.info(f"ollama: app profile says skip for window {window!r}")
+        return text
+    prompt = _OLLAMA_INSTRUCTION
+    if vocab_hint:
+        prompt += f"\nKnown vocabulary (use these exact spellings): {vocab_hint}"
+    if window:
+        # App context (window TITLE only — content is never read): lets the
+        # model match register, e.g. an email vs a quick note vs a chat.
+        prompt += f"\nThe text is being dictated into this window: {window}"
+    if style:
+        prompt += f"\nStyle for this app: {style}"
+    prompt += f"\n\nText: {text}"
+    body = json.dumps({
+        "model": OLLAMA_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+    }).encode("utf-8")
+    # Long dictations produce proportionally long cleanups — scale the timeout
+    # with text length so long-form doesn't silently fall back to raw.
+    timeout = OLLAMA_TIMEOUT_SECS + len(text) / 200.0
+    t0 = time.time()
+    try:
+        req = urllib.request.Request(f"{OLLAMA_URL}/chat/completions", data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            out = (json.loads(r.read().decode("utf-8"))["choices"][0]["message"]
+                   .get("content") or "").strip()
+        logging.info(f"ollama cleanup: {len(text)} chars in {time.time()-t0:.1f}s")
+        out = out.strip('"').strip()
+        # Guardrail: the model must not rewrite/expand — big length drift means
+        # it disobeyed (hallucinated or summarized), so keep the raw transcript.
+        if not out or len(out) > len(text) * 1.6 + 20 or len(out) < len(text) * 0.4:
+            logging.warning("ollama: output failed sanity check, using raw text")
+            _log_cleanup_pair(text, "[REJECTED] " + (out or ""), OLLAMA_MODEL,
+                              time.time() - t0, window)
+            return text
+        _log_cleanup_pair(text, out, OLLAMA_MODEL, time.time() - t0, window)
+        return out
+    except Exception as e:
+        logging.warning(f"ollama cleanup unavailable ({e}); using raw text")
+        return text
 
 # ── Audio ducking ───────────────────────────────────────────────────
 def _session_key(s):
@@ -437,7 +882,10 @@ def process_commands(text, radio=True):
     """Process radio commands. Returns (cleaned_text, press_enter).
 
     radio=True enables break/over/correction/disregard (voice-activation only).
-    radio=False skips them (manual PTT — just transcribe literally).
+    radio="over" enables ONLY the trailing-"over"-presses-Enter command —
+    the manual-PTT opt-in (MANUAL_OVER setting). Other commands stay off so
+    ordinary speech can't delete words or cancel an utterance.
+    radio=False skips all commands (manual PTT — just transcribe literally).
     Returns (None, False) for disregard.
     """
     if not text or not text.strip():
@@ -456,7 +904,7 @@ def process_commands(text, radio=True):
         return (None, False)
 
     # Check for disregard anywhere (voice-activation only)
-    if radio:
+    if radio is True:
         for w in words:
             if strip_punctuation(w).lower() == "disregard":
                 logging.info("Disregard command")
@@ -530,7 +978,7 @@ def process_commands(text, radio=True):
             if result:
                 result[-1] = result[-1].rstrip('.,;:?!') + w
             continue
-        elif radio and cleaned == "break":
+        elif radio is True and cleaned == "break":
             result.append("\n")
         elif radio and cleaned == "over" and i == len(words) - 1:
             press_enter = True
@@ -539,7 +987,7 @@ def process_commands(text, radio=True):
             keep = ''.join(c for c in trailing if c in '?!')
             if keep and result:
                 result[-1] = result[-1].rstrip('.,;:?!') + keep
-        elif radio and cleaned == "correction":
+        elif radio is True and cleaned == "correction":
             if result:
                 popped = result.pop()
                 logging.info(f"Correction: removed '{popped}'")
@@ -591,10 +1039,15 @@ def _is_terminal_like_window():
         return True, title
     return any(hint in title for hint in TERMINAL_TITLE_HINTS), title
 
+_last_pasted_text = ""   # most recent injected dictation — diff target for teach mode
+
 def paste_text(text, press_enter=False):
     """Type into terminal-like windows, otherwise clipboard-paste with restore."""
+    global _last_pasted_text
     if not text and not press_enter:
         return
+    if text:
+        _last_pasted_text = text
 
     old_clip = None
     used_direct_type = False
@@ -627,16 +1080,553 @@ def paste_text(text, press_enter=False):
     if old_clip is not None:
         pyperclip.copy(old_clip)
 
+# ── Teach mode (Wispr-style correction learning, explicit gesture) ───
+# Fix the pasted text in place, select the corrected version, hit the teach key.
+# We diff the selection against what we last injected, extract the changed word
+# pairs, and add them to the dictionary — corrections map + vocab. No passive
+# monitoring of what you type; learning only happens on the explicit gesture.
+
+def _norm_word(w):
+    """Normalize a word for diff alignment: lowercase, strip outer punctuation."""
+    return re.sub(r"^[^\w&$@#~/]+|[^\w&$@#~/%+)\]]+$", "", w).lower()
+
+def _clean_token(w):
+    """Strip sentence punctuation from a learned token, keep inner symbols."""
+    return re.sub(r"^[\"'(\[]+|[\"')\],.:;!?]+$", "", w)
+
+def _extract_pairs(original, corrected, max_words=4):
+    """Word-level diff → (misheard, correct) pairs.
+
+    Only small 'replace' runs count — insertions/deletions are content edits,
+    not mishearings. Case-only changes are harvested from 'equal' runs too,
+    but only non-trivial casing (NMFC, TForce, InXpress): plain Capitalized
+    forms are sentence mechanics and would over-learn common words."""
+    ow, cw = original.split(), corrected.split()
+    sm = difflib.SequenceMatcher(a=[_norm_word(w) for w in ow],
+                                 b=[_norm_word(w) for w in cw], autojunk=False)
+    pairs = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "replace" and (i2 - i1) <= max_words and (j2 - j1) <= max_words:
+            wrong = " ".join(_norm_word(w) for w in ow[i1:i2]).strip()
+            right = " ".join(_clean_token(w) for w in cw[j1:j2]).strip()
+            if wrong and right and wrong != right.lower():
+                pairs.append((wrong, right))
+        elif tag == "equal":
+            for k in range(i2 - i1):
+                o, c = ow[i1 + k], cw[j1 + k]
+                oc, cc = _clean_token(o), _clean_token(c)
+                if oc == cc or oc.lower() != cc.lower():
+                    continue   # identical, or not a pure case change
+                if cc == oc.capitalize():
+                    continue   # ordinary capitalization, not jargon casing
+                pairs.append((oc.lower(), cc))
+    return pairs
+
+def teach_from_selection():
+    """Learn corrections by diffing the user's selected (fixed) text against
+    the last injected dictation."""
+    global EFFECTIVE_PROMPT
+    last = (_last_pasted_text or "").strip()
+    if not last:
+        beep_async([(400, 120)])
+        logging.info("teach: nothing was dictated yet")
+        return
+    try:
+        old_clip = pyperclip.paste()
+    except Exception:
+        old_clip = ""
+    try:
+        pyautogui.hotkey('ctrl', 'c')
+        time.sleep(0.15)
+        corrected = (pyperclip.paste() or "").strip()
+    except Exception:
+        logging.exception("teach: could not read selection")
+        corrected = ""
+    finally:
+        try:
+            pyperclip.copy(old_clip)
+        except Exception:
+            pass
+    if not corrected or corrected == old_clip.strip():
+        beep_async([(400, 120)])
+        logging.info("teach: no selection captured (select the corrected text first)")
+        return
+    if corrected == last:
+        beep_async([(400, 120)])
+        logging.info("teach: selection identical to last dictation, nothing to learn")
+        return
+
+    pairs = _extract_pairs(last, corrected)
+    if not pairs:
+        beep_async([(400, 120)])
+        logging.info("teach: no learnable word-level differences found")
+        return
+
+    vocab_added = []
+    for wrong, right in pairs:
+        _dictionary["corrections"][wrong] = right
+        # New proper nouns also go in vocab so Whisper can get them right
+        # first try next time (single tokens with a capital or digit).
+        if (" " not in right and right not in _dictionary["vocab"]
+                and any(ch.isupper() or ch.isdigit() for ch in right)):
+            _dictionary["vocab"].append(right)
+            vocab_added.append(right)
+    _dictionary["_teach_history"].append({
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "pairs": [[w, r] for w, r in pairs],
+        "vocab_added": vocab_added,
+    })
+    del _dictionary["_teach_history"][:-20]   # keep last 20 events
+    save_dictionary()
+    EFFECTIVE_PROMPT = build_initial_prompt(_dictionary)
+    learned = ", ".join(f"{w}→{r}" for w, r in pairs)
+    logging.info(f"teach: learned {learned}")
+    beep_async([(523, 70), (659, 70), (784, 90)])   # success arpeggio
+    if _tray_icon:
+        _tray_icon.title = f"Learned: {learned[:96]}"
+
+def undo_last_teach():
+    """Revert the most recent teach event — its corrections and any vocab it
+    added. One bad learn ("bols"→"both") silently poisons every future
+    dictation; this makes the teach key fearless."""
+    global EFFECTIVE_PROMPT
+    hist = _dictionary.get("_teach_history") or []
+    if not hist:
+        beep_async([(400, 120)])
+        logging.info("undo teach: history is empty")
+        return
+    event = hist.pop()
+    for wrong, right in event.get("pairs", []):
+        if _dictionary["corrections"].get(wrong) == right:
+            del _dictionary["corrections"][wrong]
+    for word in event.get("vocab_added", []):
+        if word in _dictionary["vocab"]:
+            _dictionary["vocab"].remove(word)
+    save_dictionary()
+    EFFECTIVE_PROMPT = build_initial_prompt(_dictionary)
+    undone = ", ".join(f"{w}→{r}" for w, r in event.get("pairs", []))
+    logging.info(f"undo teach: reverted {undone}")
+    beep_async([(784, 70), (659, 70), (523, 90)])   # descending arpeggio
+    if _tray_icon:
+        _tray_icon.title = f"Undid teach: {undone[:90]}"
+
+# ── Note-capture PTT ─────────────────────────────────────────────────
+def _open_capture_target():
+    """Open the capture URI (e.g. an obsidian:// quick-note link) and focus the
+    target window, while recording is already running. {date}/{time} in the
+    template are substituted URL-encoded. Best-effort: any failure just means
+    the paste lands wherever focus is, same as plain PTT."""
+    try:
+        now = time.localtime()
+        uri = CAPTURE_URI.format(
+            date=urllib.parse.quote(time.strftime("%Y-%m-%d", now)),
+            time=urllib.parse.quote(time.strftime("%H:%M", now)),
+        )
+        os.startfile(uri)
+        logging.info(f"capture: opened {uri}")
+    except Exception:
+        logging.exception("capture: could not open URI")
+        return
+    if not CAPTURE_WINDOW_HINT:
+        return
+    try:
+        import pygetwindow as gw
+        time.sleep(0.9)   # let the app raise the note
+        wins = [w for w in gw.getAllWindows()
+                if CAPTURE_WINDOW_HINT.lower() in (w.title or "").lower()]
+        if wins:
+            wins[0].activate()
+            time.sleep(0.25)
+            with key_sender.pressed(keyboard.Key.ctrl):
+                key_sender.press(keyboard.Key.end)
+                key_sender.release(keyboard.Key.end)
+            logging.info(f"capture: focused '{wins[0].title}', cursor to end")
+    except Exception:
+        logging.exception("capture: window focus failed (paste follows focus)")
+
+def _append_capture_text(text):
+    """Deliver a capture-session transcript. File mode appends directly to the
+    note file — completely silent, no window opens, no focus stolen (a vault
+    app like Obsidian live-reloads the file). URI mode goes through the app's
+    own handler (which usually raises its window). Both are cursor-independent."""
+    now = time.localtime()
+    if CAPTURE_FILE:
+        path = CAPTURE_FILE.format(date=time.strftime("%Y-%m-%d", now),
+                                   time=time.strftime("%H:%M", now))
+        entry = CAPTURE_ENTRY.format(date=time.strftime("%Y-%m-%d", now),
+                                     time=time.strftime("%H:%M", now), text=text)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(entry)
+        logging.info(f"capture: appended {len(text)} chars to {path}")
+        return
+    uri = CAPTURE_TEXT_URI.format(
+        date=urllib.parse.quote(time.strftime("%Y-%m-%d", now)),
+        time=urllib.parse.quote(time.strftime("%H:%M", now)),
+        text=urllib.parse.quote(text),
+    )
+    os.startfile(uri)
+    logging.info(f"capture: appended {len(text)} chars via URI")
+
+# ── Voice commands ───────────────────────────────────────────────────
+# Dictations starting with COMMAND_PREFIX run an action from the dictionary's
+# voice_commands map instead of pasting text. Deterministic lookup — no LLM
+# decides what executes. Actions: "keys:win+shift+s", "run:calc.exe",
+# "open:obsidian://...". Hot-editable like the rest of dictionary.json.
+_KEYNAMES = {
+    "win": keyboard.Key.cmd, "ctrl": keyboard.Key.ctrl, "alt": keyboard.Key.alt,
+    "shift": keyboard.Key.shift, "enter": keyboard.Key.enter, "tab": keyboard.Key.tab,
+    "esc": keyboard.Key.esc, "space": keyboard.Key.space, "del": keyboard.Key.delete,
+    "home": keyboard.Key.home, "end": keyboard.Key.end,
+    "printscreen": keyboard.Key.print_screen, "prtsc": keyboard.Key.print_screen,
+    # global media keys — players (Spotify etc.) obey these without focus
+    "play_pause": keyboard.Key.media_play_pause,
+    "next_track": keyboard.Key.media_next,
+    "prev_track": keyboard.Key.media_previous,
+    "volume_up": keyboard.Key.media_volume_up,
+    "volume_down": keyboard.Key.media_volume_down,
+    "volume_mute": keyboard.Key.media_volume_mute,
+    **{f"f{i}": getattr(keyboard.Key, f"f{i}") for i in range(1, 21)},
+}
+
+def _match_voice_command(text, commands, prefix):
+    """(action, consumed): consumed=True means the utterance was a command
+    attempt (matched or not) and must NOT be pasted.
+
+    Two key styles:
+      "screenshot"        — classic: spoken as "<prefix> screenshot"
+      "browse to reddit"  — full-phrase: any multi-word key whose first word
+                            isn't the prefix defines its OWN trigger word, so
+                            new command families need no code change.
+    Exact match first, then prefix-overlap either direction."""
+    if not commands:
+        return None, False
+    words = re.sub(r"[^\w\s+]", " ", (text or "").lower()).split()
+    if not words:
+        return None, False
+
+    def lookup(phrase, keys, *, strict=False):
+        if not phrase:
+            return None
+        if phrase in keys:
+            return commands[keys[phrase]]
+        if strict:
+            # Trigger-word mode (no explicit "command" prefix): EXACT match only.
+            # A bare/partial word must never fire a longer command (saying "lock"
+            # must not run "lock it down"), and a long sentence must never be
+            # swallowed by a short command prefix ("music play the latest idea").
+            return None
+        for kl in sorted(keys, key=len, reverse=True):
+            # Classic mode (you said "command …"): allow shorthands, but require a
+            # word boundary so a longer key can't match a partial word.
+            if phrase.startswith(kl + " ") or kl.startswith(phrase):
+                return commands[keys[kl]]
+        return None
+
+    if words[0] == prefix.lower():
+        keys = {k.lower(): k for k in commands
+                if k.split()[0].lower() != words[0]}   # classic, prefix-less keys
+        return lookup(" ".join(words[1:]), keys), True
+
+    triggers = {k.split()[0].lower() for k in commands if " " in k}
+    if words[0] in triggers:
+        phrase = " ".join(words)
+        family = {k.lower(): k for k in commands
+                  if k.split()[0].lower() == words[0]}   # full-phrase keys
+        plain = {kl: k for kl, k in family.items() if not kl.endswith(" *")}
+        action = lookup(phrase, plain, strict=True)
+        if action is not None:
+            return action, True
+        # Parameterized keys: "search google *" captures the remainder as the
+        # query — {query} is URL-encoded, {raw} is the spoken text as-is.
+        for kl in sorted(family, key=len, reverse=True):
+            if not kl.endswith(" *"):
+                continue
+            fixed = kl[:-2]
+            if phrase.startswith(fixed + " "):
+                remainder = phrase[len(fixed):].strip()
+                if remainder:
+                    tmpl = commands[family[kl]]
+                    # %20 encoding (not +): every engine accepts it, and some
+                    # (ClassIT) treat a literal + as part of the search text.
+                    return (tmpl.replace("{query}", urllib.parse.quote(remainder, safe=""))
+                                .replace("{raw}", remainder)), True
+        # Near-miss: the utterance looks like a FLUBBED command — its opening two
+        # words match a command's start AND it isn't much longer than that command
+        # (a garbled tail). Consume + beep, paste nothing. A longer sentence that
+        # merely begins with those words is ordinary speech — leave it alone so we
+        # never swallow real dictation.
+        two = " ".join(words[:2])
+        near = [kl for kl in family if kl.startswith(two)] if len(words) >= 2 else []
+        if near and len(words) <= min(len(kl.split()) for kl in near) + 1:
+            return None, True
+        return None, False
+
+    return None, False
+
+# Media keys go through native keybd_event: pynput's injected input crashed
+# the process when fired re-entrantly, and extended keys are exactly what the
+# raw API exists for. Never sent from inside an input-hook callback (commands
+# run on a worker thread).
+_MEDIA_VK = {
+    "play_pause": 0xB3, "next_track": 0xB0, "prev_track": 0xB1,
+    "volume_up": 0xAF, "volume_down": 0xAE, "volume_mute": 0xAD,
+}
+
+def _tap_media_vk(vk):
+    import ctypes
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP = 0x1, 0x2
+    ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY, 0)
+    ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+
+def _send_keys(spec):
+    parts = [p.strip().lower() for p in spec.split("+") if p.strip()]
+    if not parts:
+        return
+    if len(parts) == 1 and parts[0] in _MEDIA_VK:
+        _tap_media_vk(_MEDIA_VK[parts[0]])
+        return
+    keys = [_KEYNAMES.get(p, p) for p in parts]
+    *mods, last = keys
+    if mods:
+        with key_sender.pressed(*mods):
+            key_sender.press(last)
+            key_sender.release(last)
+    else:
+        key_sender.press(last)
+        key_sender.release(last)
+
+def _execute_voice_command(action):
+    import subprocess
+    if action.startswith("keys:"):
+        _send_keys(action[5:])
+    elif action.startswith("run:"):
+        subprocess.Popen(action[4:], shell=True)   # user's own config, own machine
+    elif action.startswith("open:"):
+        os.startfile(action[5:])
+    else:
+        raise ValueError(f"unknown action type: {action!r}")
+
+def try_voice_command(text):
+    """Intercept command-prefixed dictations. Returns True if consumed."""
+    action, consumed = _match_voice_command(
+        text, _dictionary.get("voice_commands") or {}, COMMAND_PREFIX)
+    if not consumed:
+        return False
+    if action is None:
+        logging.info(f"voice command: no match for {text!r}")
+        beep_async([(400, 120)])
+        return True
+
+    def run():
+        try:
+            _execute_voice_command(action)
+            logging.info(f"voice command: {text!r} -> {action!r}")
+            beep_async([(880, 60), (1175, 80)])
+        except Exception:
+            logging.exception(f"voice command failed: {action!r}")
+            beep_async([(400, 120)])
+
+    # Worker thread: never execute (especially key injection) from inside the
+    # input-hook callback that delivered the PTT release — re-entrancy there
+    # has crashed the process natively.
+    threading.Thread(target=run, daemon=True).start()
+    return True
+
+_RESTRUCTURE_INSTRUCTION = (
+    "Restructure this spoken ramble into clean, concise markdown notes. Use short "
+    "bullet points; phrase any tasks or follow-ups as '- [ ] ' checkbox items. Keep "
+    "ALL facts, names, numbers, and dates — do not summarize away detail, do not add "
+    "commentary or content that was not spoken. Return ONLY the markdown."
+)
+
+def llm_restructure(text):
+    """Turn a dictated ramble into structured markdown via Ollama. Explicit user
+    intent (the struct capture key), so it runs even when the cleanup toggle is
+    off. Falls back to the verbatim transcript on any failure."""
+    if not text or not text.strip():
+        return text
+    prompt = _RESTRUCTURE_INSTRUCTION + f"\n\nTranscript: {text}"
+    body = json.dumps({
+        "model": OLLAMA_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+    }).encode("utf-8")
+    timeout = 10.0 + len(text) / 150.0
+    t0 = time.time()
+    try:
+        req = urllib.request.Request(f"{OLLAMA_URL}/chat/completions", data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            out = (json.loads(r.read().decode("utf-8"))["choices"][0]["message"]
+                   .get("content") or "").strip()
+        # Restructuring legitimately changes length — only reject the absurd.
+        if not out or len(out) > len(text) * 3 + 100 or len(out) < len(text) * 0.25:
+            logging.warning("restructure: output failed sanity check, keeping verbatim")
+            return text
+        logging.info(f"restructure: {len(text)} chars in {time.time()-t0:.1f}s")
+        return out
+    except Exception as e:
+        logging.warning(f"restructure unavailable ({e}); keeping verbatim")
+        return text
+
+_HISTORY_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dictation-history.jsonl")
+
+def _log_dictation(raw, final, mode, window):
+    """Unified history of every manual dictation — including raw-path ones the
+    cleanup log never sees. Powers the re-paste key's paper trail and audits."""
+    try:
+        with open(_HISTORY_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "mode": mode, "window": window,
+                "raw": raw, "final": final,
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        logging.exception("dictation history log failed")
+
+def deliver_text(cleaned, press_enter, raw=""):
+    """Route a manual-session transcript: capture sessions append to the note,
+    plain PTT pastes at the cursor. Logs to history either way."""
+    global _capture_session, _capture_struct, _last_pasted_text
+    mode = ("capture-struct" if _capture_struct else
+            "capture" if _capture_session else "ptt")
+    try:
+        if _capture_session and (CAPTURE_FILE or CAPTURE_TEXT_URI) and cleaned:
+            if _capture_struct:
+                cleaned = llm_restructure(cleaned)
+            _append_capture_text(cleaned)
+            _last_pasted_text = cleaned   # teach + re-paste track captures too
+        elif cleaned or press_enter:
+            paste_text(cleaned, press_enter)
+    except Exception:
+        logging.exception("deliver_text failed, falling back to paste")
+        if cleaned or press_enter:
+            paste_text(cleaned, press_enter)
+    finally:
+        _capture_session = False
+        _capture_struct = False
+        if cleaned:
+            _log_dictation(raw, cleaned, mode, _active_window_title())
+
+def repaste_last():
+    """Re-paste the most recent transcript at the current focus — insurance for
+    when the target app ate the paste (dialog stole focus, wrong window)."""
+    last = (_last_pasted_text or "").strip()
+    if not last:
+        beep_async([(400, 120)])
+        logging.info("repaste: nothing to re-paste")
+        return
+    paste_text(last)
+    logging.info(f"repaste: {len(last)} chars")
+
 # ── Audio callback ──────────────────────────────────────────────────
+_mic_rms = 0.0   # live input level, feeds the recording indicator
+
 def audio_callback(indata, frames, time_info, status):
+    global _mic_rms
+    try:
+        _mic_rms = float(np.sqrt(np.mean(np.square(indata))))
+    except Exception:
+        pass
     try:
         audio_q.put_nowait(indata.copy().flatten())
     except queue.Full:
         pass  # drop chunk silently
 
+# ── Recording indicator (speech-wave overlay) ───────────────────────
+# A small always-on-top bubble near the cursor while the mic is hot: bars
+# driven by live input level (blue = recording, orange pulse = transcribing).
+# The window is NEVER unmapped or activated — it parks off-screen when idle —
+# so it can never steal focus from the paste target. Any failure disables it
+# for the session; dictation is unaffected.
+INDICATOR = True
+
+def _indicator_loop():
+    try:
+        import tkinter as tk
+        logging.info("indicator: thread started")
+        W, H, N = 104, 34, 7          # bubble size, bar count
+        OFFSCREEN = f"{W}x{H}+-{W*3}+-{H*3}"
+        root = tk.Tk()
+        root.overrideredirect(True)
+        root.attributes("-topmost", True)
+        try:
+            root.attributes("-alpha", 0.92)
+        except Exception:
+            pass
+        root.geometry(OFFSCREEN)
+        canvas = tk.Canvas(root, width=W, height=H, bg="#1b1f27", highlightthickness=0)
+        canvas.pack()
+        root.withdraw()   # hidden via unmap; deiconify on show (off-screen parking
+        root.update()     # alone left the window unpainted on multi-monitor setups)
+        logging.info("indicator: window created (withdrawn)")
+        hist = [0.0] * N
+        visible = False
+        shown_once = False
+        while True:
+            with state_lock:
+                cur = state
+            if cur in (State.MANUAL, State.PROCESSING, State.PAUSED):
+                if not visible:
+                    try:
+                        x, y = pyautogui.position()
+                    except Exception:
+                        x, y = 300, 300
+                    root.geometry(f"{W}x{H}+{x + 18}+{y + 26}")
+                    root.deiconify()
+                    root.lift()
+                    root.attributes("-topmost", True)
+                    visible = True
+                    if not shown_once:
+                        logging.info(f"indicator: first show at {x + 18},{y + 26}")
+                        shown_once = True
+                canvas.delete("all")
+                if cur == State.PAUSED:
+                    # static pause glyph — shape change, not just color
+                    for cx in (W // 2 - 12, W // 2 + 4):
+                        canvas.create_rectangle(cx, 8, cx + 8, H - 8,
+                                                fill="#8a93a6", width=0)
+                else:
+                    hist.pop(0)
+                    if cur == State.MANUAL:
+                        hist.append(min(1.0, (max(_mic_rms, 0.0) * 8.0) ** 0.7))
+                        color = "#4aa3ff"                   # blue: recording
+                    else:
+                        hist.append(0.55 + 0.4 * np.sin(time.time() * 6.0))
+                        color = "#ff9f40"                   # orange: transcribing
+                    bw, gap = 8, 6
+                    x0 = (W - (N * bw + (N - 1) * gap)) // 2
+                    for i, v in enumerate(hist):
+                        h = max(3, int(v * (H - 10)))
+                        cx = x0 + i * (bw + gap)
+                        canvas.create_rectangle(cx, H // 2 - h // 2, cx + bw,
+                                                H // 2 + h // 2, fill=color, width=0)
+                root.update()
+                time.sleep(1 / 30)
+            else:
+                if visible:
+                    root.withdraw()
+                    visible = False
+                root.update()
+                time.sleep(0.12)
+    except Exception:
+        logging.exception("indicator failed — disabled for this session")
+
+_indicator_started = False
+
+def start_indicator():
+    global _indicator_started
+    if _indicator_started or not INDICATOR:
+        return
+    _indicator_started = True
+    threading.Thread(target=_indicator_loop, daemon=True, name="indicator").start()
+
 # ── VAD monitor thread ──────────────────────────────────────────────
-def vad_monitor():
-    global state, vad_enabled
+_vad_generation = 0   # bumped by run_listener per restart; stale monitors exit
+
+def vad_monitor(generation):
+    global state, vad_enabled, _toggle_session
 
     vad = vad_model
     vad.reset_states()
@@ -649,9 +1639,39 @@ def vad_monitor():
     cooldown_until = 0.0  # timestamp: ignore VAD until this time
 
     while True:
+        if generation != _vad_generation:
+            # A restarted run_listener() started a fresh monitor; exit so two
+            # threads never split audio_q between them (chunks would be lost
+            # from recordings and VAD would see gaps).
+            logging.info(f"vad_monitor gen {generation}: superseded, exiting")
+            return
         try:
             chunk = audio_q.get(timeout=0.5)
         except queue.Empty:
+            # Mic-death watch (T2-D): a healthy mic delivers frames
+            # continuously even in dead silence, so "no frames at all for
+            # MIC_DEAD_TIMEOUT during an active recording" means the input
+            # stream died (e.g. DJI Mic Mini auto-power-off) -- not a quiet
+            # user. Abort the recording with feedback instead of letting the
+            # user dictate into a dead stream, and trigger the device
+            # re-scan so the InputStream reopens when the mic returns.
+            with state_lock:
+                recording_dead = (state == State.MANUAL and
+                                  time.time() - last_chunk_time > MIC_DEAD_TIMEOUT)
+            if recording_dead:
+                logging.error(f"mic dead: no audio frames for {MIC_DEAD_TIMEOUT}s "
+                              "during recording -- aborting, rescanning device")
+                # Stamp this pin dead so the restart's find_device() falls
+                # through to the next priority pin instead of re-picking it.
+                _mark_device_dead(_active_device_name)
+                with state_lock:
+                    state = State.IDLE
+                manual_chunks.clear()
+                _toggle_session = False
+                update_tray()
+                beep_async(MIC_DEAD_CHIRP, then=_delayed_restore)
+                last_chunk_time = time.time()   # don't re-trip until frames resume
+                _restart_event.set()            # reopen the InputStream
             continue
 
         now = time.time()
@@ -662,8 +1682,9 @@ def vad_monitor():
             cur = state
 
         # Skip VAD processing during manual mode or processing
-        if cur in (State.MANUAL, State.PROCESSING):
-            # During manual mode, collect chunks for F9
+        if cur in (State.MANUAL, State.PROCESSING, State.PAUSED):
+            # During manual mode, collect chunks for F9. PAUSED consumes and
+            # DISCARDS chunks so stale audio never piles up for the resume.
             if cur == State.MANUAL:
                 manual_chunks.append(chunk)
             buf = np.array([], dtype=np.float32)
@@ -748,6 +1769,8 @@ def vad_monitor():
                     logging.info(f"Hot mic: '{text}'")
                     duck_audio()
                     cleaned, press_enter = process_commands(text)
+                    if cleaned:
+                        cleaned = llm_cleanup(cleaned)
                     if cleaned or press_enter:
                         paste_text(cleaned, press_enter)
                     restore_audio()
@@ -762,6 +1785,8 @@ def vad_monitor():
                     logging.info(f"Complete utterance: '{text}'")
                     duck_audio()
                     cleaned, press_enter = process_commands(text)
+                    if cleaned:
+                        cleaned = llm_cleanup(cleaned)
                     if cleaned or press_enter:
                         paste_text(cleaned, press_enter)
                     restore_audio()
@@ -787,6 +1812,7 @@ _STATE_COLORS = {
     State.MANUAL:     (50,  200,  50),
     State.CHECKING:   (220, 200,   0),
     State.PROCESSING: (220, 200,   0),
+    State.PAUSED:     (70,  130, 200),
 }
 
 def _make_tray_image(state_val: State, hot_mic_active: bool) -> Image.Image:
@@ -856,6 +1882,9 @@ def _on_set_device(name):
     def cb(icon, item):
         global DEVICE_NAME
         DEVICE_NAME = name
+        # Explicit user pick overrides stale liveness verdicts — re-probe fresh.
+        _mic_dead_cache.pop(name, None)
+        _mic_alive_cache.pop(name, None)
         save_settings()
         _restart_event.set()
     return cb
@@ -872,12 +1901,74 @@ def _on_bind(target: str):
         logging.info(f"Binding mode: {target}")
     return cb
 
+def _on_toggle_ollama(icon, item):
+    global OLLAMA_CLEANUP
+    OLLAMA_CLEANUP = not OLLAMA_CLEANUP
+    save_settings()
+    update_tray()
+
+def _on_toggle_manual_over(icon, item):
+    global MANUAL_OVER
+    MANUAL_OVER = not MANUAL_OVER
+    save_settings()
+    update_tray()
+
+def _on_toggle_indicator(icon, item):
+    global INDICATOR
+    INDICATOR = not INDICATOR
+    if INDICATOR:
+        start_indicator()   # no-op if the thread already runs
+    save_settings()
+    update_tray()
+
+def _on_teach(icon, item):
+    threading.Thread(target=teach_from_selection, daemon=True).start()
+
+def _on_undo_teach(icon, item):
+    threading.Thread(target=undo_last_teach, daemon=True).start()
+
+def _on_reload_dict(icon, item):
+    load_dictionary()
+    beep_async([(659, 70), (784, 70)])
+    update_tray()
+
+def _on_open_dict(icon, item):
+    try:
+        os.startfile(DICT_FILE)
+    except Exception:
+        logging.exception("open dictionary.json failed")
+
+def _on_edit_dict_gui(icon, item):
+    """Launch the dictionary editor GUI as its own process. Saves hot-apply on
+    the next dictation via the mtime reload — no restart needed."""
+    try:
+        import subprocess
+        editor = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "dictionary_editor.py")
+        subprocess.Popen([sys.executable, editor], close_fds=True)
+    except Exception:
+        logging.exception("launch dictionary editor failed")
+
 def _on_restart(icon, item):
     _restart_event.set()
 
 def _on_quit(icon, item):
     icon.stop()
     os._exit(0)   # sys.exit() is swallowed by pynput's blocked .join()
+
+def _on_disable(icon, item):
+    """Disable Whisper from the tray: write the watchdog disable flag, then exit.
+    Frees the Whisper model from VRAM and keeps it off — the watchdog sees the
+    flag and won't relaunch ptt.py. Re-enable with enable-whisper.ps1 or the
+    'Enable Whisper' desktop shortcut (the tray is gone once this exits)."""
+    try:
+        with open(DISABLE_FLAG, "w", encoding="utf-8") as f:
+            f.write("disabled via tray " + time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
+        logging.info("Disabled via tray; wrote %s", DISABLE_FLAG)
+    except Exception:
+        logging.exception("could not write disable flag")
+    icon.stop()
+    os._exit(0)
 
 def _get_input_devices():
     return [(i, d["name"]) for i, d in enumerate(sd.query_devices())
@@ -903,6 +1994,18 @@ def build_menu():
                          _on_bind("hot_mic_key")),
         pystray.MenuItem(lambda item: f"VAD key: {_key_label(VAD_KEY)}",
                          _on_bind("vad_key")),
+        pystray.MenuItem(lambda item: f"Teach key: {_key_label(TEACH_KEY)}",
+                         _on_bind("teach_key")),
+        pystray.MenuItem(lambda item: f"Capture key: {_key_label(CAPTURE_KEY)}",
+                         _on_bind("capture_key")),
+        pystray.MenuItem(lambda item: f"Re-paste key: {_key_label(REPASTE_KEY)}",
+                         _on_bind("repaste_key")),
+        pystray.MenuItem(lambda item: f"Structured capture key: {_key_label(CAPTURE_STRUCT_KEY)}",
+                         _on_bind("capture_struct_key")),
+        pystray.MenuItem(lambda item: f"Open-record toggle key: {_key_label(TOGGLE_KEY)}",
+                         _on_bind("toggle_key")),
+        pystray.MenuItem(lambda item: f"Open-record finish key: {_key_label(FINISH_KEY)}",
+                         _on_bind("finish_key")),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(lambda item: f"PTT mouse button: {_button_label(PTT_MOUSE_BUTTON)}",
                          _on_bind("ptt_mouse_button")),
@@ -910,12 +2013,36 @@ def build_menu():
         pystray.MenuItem("(click an entry, then press the new key / mouse button — Esc cancels)",
                          None, enabled=False),
     )
+    dict_items = pystray.Menu(
+        pystray.MenuItem(lambda item: f"Teach from selection ({_key_label(TEACH_KEY)})",
+                         _on_teach),
+        pystray.MenuItem(
+            lambda item: ("Undo last teach"
+                          + ((" (" + ", ".join(f"{w}→{r}" for w, r in
+                              (_dictionary.get("_teach_history") or [{}])[-1].get("pairs", [])[:2]) + ")")
+                             if (_dictionary.get("_teach_history") or []) else " (none)")),
+            _on_undo_teach),
+        pystray.MenuItem("Edit dictionary (GUI)",  _on_edit_dict_gui),
+        pystray.MenuItem("Reload dictionary.json", _on_reload_dict),
+        pystray.MenuItem("Open dictionary.json",   _on_open_dict),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(lambda item: (f"{len(_dictionary['vocab'])} vocab / "
+                                       f"{len(_dictionary['corrections'])} corrections"),
+                         None, enabled=False),
+    )
     return pystray.Menu(
         pystray.MenuItem(lambda item: f"PTT: {state.name}", None, enabled=False),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("VAD enabled", _on_toggle_vad, checked=lambda item: vad_enabled),
         pystray.MenuItem("Hot mic",     _on_toggle_hot_mic, checked=lambda item: hot_mic),
+        pystray.MenuItem(lambda item: f"Ollama cleanup ({OLLAMA_MODEL})",
+                         _on_toggle_ollama, checked=lambda item: OLLAMA_CLEANUP),
+        pystray.MenuItem("Recording indicator", _on_toggle_indicator,
+                         checked=lambda item: INDICATOR),
+        pystray.MenuItem("Trailing 'over' presses Enter (manual PTT)",
+                         _on_toggle_manual_over, checked=lambda item: MANUAL_OVER),
         pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Dictionary",   dict_items),
         pystray.MenuItem("Duck level",   pystray.Menu(*duck_items)),
         pystray.MenuItem("Beep backend", pystray.Menu(*beep_items)),
         pystray.MenuItem("Beep volume",  pystray.Menu(*beep_vol_items)),
@@ -923,6 +2050,7 @@ def build_menu():
         pystray.MenuItem("Hotkeys",      hotkey_items),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Restart PTT", _on_restart),
+        pystray.MenuItem("Disable Whisper (free GPU)", _on_disable),
         pystray.MenuItem("Quit",        _on_quit),
     )
 
@@ -937,7 +2065,8 @@ def start_tray():
 # ── Binding capture ──────────────────────────────────────────────────
 def _finish_bind(mode: str, key: keyboard.Key | keyboard.KeyCode) -> None:
     """Assign the captured key to the binding target and persist."""
-    global PTT_KEY, HOT_MIC_KEY, VAD_KEY, _binding_mode
+    global PTT_KEY, HOT_MIC_KEY, VAD_KEY, TEACH_KEY, CAPTURE_KEY, REPASTE_KEY, \
+           CAPTURE_STRUCT_KEY, TOGGLE_KEY, FINISH_KEY, _binding_mode
     if key == keyboard.Key.esc:          # Escape cancels without changing anything
         logging.info("Bind cancelled (Escape)")
     else:
@@ -947,6 +2076,18 @@ def _finish_bind(mode: str, key: keyboard.Key | keyboard.KeyCode) -> None:
             HOT_MIC_KEY = key
         elif mode == "vad_key":
             VAD_KEY = key
+        elif mode == "teach_key":
+            TEACH_KEY = key
+        elif mode == "capture_key":
+            CAPTURE_KEY = key
+        elif mode == "repaste_key":
+            REPASTE_KEY = key
+        elif mode == "capture_struct_key":
+            CAPTURE_STRUCT_KEY = key
+        elif mode == "toggle_key":
+            TOGGLE_KEY = key
+        elif mode == "finish_key":
+            FINISH_KEY = key
         logging.info(f"Bound {mode} → {_key_label(key)}")
         save_settings()
     with _binding_lock:
@@ -971,10 +2112,97 @@ def _cancel_bind() -> None:
         _binding_mode = None
     update_tray()
 
-# ── Keyboard handlers ──────────────────────────────────────────────
-def on_press(key):
-    global state, manual_chunks
+# ── Open recording (tap to record / pause / resume, finish key submits) ──
+def toggle_recording():
+    """TOGGLE_KEY tap: IDLE → record, recording → pause, paused → resume.
+    No holding — built for long rants you want to pause and come back to.
+    While paused, audio un-ducks and incoming chunks are discarded."""
+    global state, manual_chunks, _toggle_session, _capture_session, _capture_struct
+    with state_lock:
+        cur = state
+    if cur in (State.IDLE, State.BUFFERING, State.CHECKING):
+        with state_lock:
+            prev = state
+            state = State.MANUAL
+        update_tray()
+        manual_chunks = []
+        _toggle_session = True
+        # Open recordings are never capture sessions — declare the kind so a leaked
+        # capture flag can't route the finished text into the note file.
+        _capture_session = False
+        _capture_struct = False
+        if prev in (State.BUFFERING, State.CHECKING):
+            restore_audio()
+        duck_audio()
+        beep_async(PRESS_CHIRP)
+        logging.info("toggle: open recording started")
+    elif cur == State.MANUAL and _toggle_session:
+        with state_lock:
+            state = State.PAUSED
+        update_tray()
+        restore_audio()           # give the room its sound back while paused
+        beep_async(PAUSE_CHIRP)
+        logging.info("toggle: paused")
+    elif cur == State.PAUSED:
+        with state_lock:
+            state = State.MANUAL
+        update_tray()
+        duck_audio()
+        beep_async(PRESS_CHIRP)
+        logging.info("toggle: resumed")
+
+def finish_recording():
+    """FINISH_KEY tap: end the open recording → transcribe → normal pipeline."""
+    global state, manual_chunks, _toggle_session
+    with state_lock:
+        if not _toggle_session or state not in (State.MANUAL, State.PAUSED):
+            return
+        state = State.PROCESSING
+    update_tray()
+    beep_async(RELEASE_CHIRP, then=_delayed_restore)
+    while True:
+        try:
+            manual_chunks.append(audio_q.get_nowait())
+        except queue.Empty:
+            break
     try:
+        if manual_chunks:
+            audio = np.concatenate(manual_chunks)
+            logging.info(f"toggle: finishing, {len(audio) / SAMPLE_RATE:.1f}s of audio")
+            text = transcribe(audio)
+            if text.strip():
+                logging.info(f"toggle raw: {text}")
+                if not _capture_session and try_voice_command(text):
+                    pass
+                else:
+                    cleaned, press_enter = process_commands(
+                        text, radio="over" if MANUAL_OVER else False)
+                    if cleaned:
+                        cleaned = llm_cleanup(cleaned)
+                    deliver_text(cleaned, press_enter, raw=text)
+            else:
+                logging.info("toggle: no speech detected")
+        else:
+            logging.info("toggle: no audio captured")
+    except Exception:
+        logging.exception("toggle: finish failed")
+    finally:
+        manual_chunks = []
+        _toggle_session = False
+        with state_lock:
+            state = State.IDLE
+        update_tray()
+
+# ── Keyboard handlers ──────────────────────────────────────────────
+_ctrl_down = False   # tracked so Ctrl+<PTT mouse button> chords (e.g. an external
+                     # Ctrl+MB5 macro) don't also start a phantom recording
+
+def on_press(key):
+    global state, manual_chunks, _ctrl_down
+    try:
+        if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r, keyboard.Key.ctrl):
+            _ctrl_down = True
+
         # Binding mode intercept — capture next key press as new binding
         with _binding_lock:
             mode = _binding_mode
@@ -987,7 +2215,23 @@ def on_press(key):
             _finish_bind(mode, key)
             return    # don't let the key also trigger its normal action
 
-        if key == PTT_KEY:
+        if key == TOGGLE_KEY:
+            threading.Thread(target=toggle_recording, daemon=True).start()
+            return
+
+        if key == FINISH_KEY:
+            threading.Thread(target=finish_recording, daemon=True).start()
+            return
+
+        if key in (PTT_KEY, CAPTURE_KEY, CAPTURE_STRUCT_KEY):
+            if _toggle_session:
+                _lockout_beep()   # audible "open recording active" — silent reads as a crash
+                return
+            global _capture_session, _capture_struct
+            is_capture = key in (CAPTURE_KEY, CAPTURE_STRUCT_KEY)
+            if is_capture and not (CAPTURE_URI or CAPTURE_FILE or CAPTURE_TEXT_URI):
+                logging.warning("capture key pressed but no capture target configured — ignoring")
+                return
             with state_lock:
                 if state == State.MANUAL:
                     return  # already recording
@@ -996,13 +2240,18 @@ def on_press(key):
                 state = State.MANUAL
             update_tray()
             manual_chunks = []
+            _capture_session = is_capture
+            _capture_struct = (key == CAPTURE_STRUCT_KEY)
             if prev in (State.BUFFERING, State.CHECKING):
                 restore_audio()
-                logging.info("RCtrl interrupted VAD recording")
+                logging.info("PTT key interrupted VAD recording")
             duck_audio()
+            if is_capture and CAPTURE_URI:
+                # Optional press-open visual; file delivery needs no window at all
+                threading.Thread(target=_open_capture_target, daemon=True).start()
             # Cute press chirp (ascending blip)
             beep_async(PRESS_CHIRP)
-            logging.info("RCtrl: recording")
+            logging.info("Capture key: recording" if is_capture else "PTT key: recording")
 
         elif key == HOT_MIC_KEY:
             global hot_mic
@@ -1026,18 +2275,30 @@ def on_press(key):
             beep_async([(800 if vad_enabled else 400, 150)])
             update_tray()
 
+        elif key == TEACH_KEY:
+            # Clipboard + key-send work off-thread so the listener never blocks
+            threading.Thread(target=teach_from_selection, daemon=True).start()
+
+        elif key == REPASTE_KEY:
+            threading.Thread(target=repaste_last, daemon=True).start()
+
     except Exception as e:
         logging.exception("Error in on_press")
 
 def on_release(key):
-    global state, manual_chunks
+    global state, manual_chunks, _ctrl_down
     try:
+        if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r, keyboard.Key.ctrl):
+            _ctrl_down = False
+
         # Ignore release events during binding mode
         with _binding_lock:
             if _binding_mode is not None:
                 return
 
-        if key == PTT_KEY:
+        if key in (PTT_KEY, CAPTURE_KEY, CAPTURE_STRUCT_KEY):
+            if _toggle_session:
+                return   # open recordings end via the finish key, not a release
             with state_lock:
                 if state != State.MANUAL:
                     return
@@ -1056,30 +2317,38 @@ def on_release(key):
                 except queue.Empty:
                     break
 
-            if manual_chunks:
-                audio = np.concatenate(manual_chunks)
-                text = transcribe(audio)
-                if text.strip():
-                    logging.info(f"F9 raw: {text}")
-                    cleaned, press_enter = process_commands(text, radio=False)
-                    if cleaned or press_enter:
-                        paste_text(cleaned, press_enter)
+            # try/finally mirrors finish_recording: a transcribe/deliver
+            # exception must never leave the tray wedged in PROCESSING.
+            try:
+                if manual_chunks:
+                    audio = np.concatenate(manual_chunks)
+                    text = transcribe(audio)
+                    if text.strip():
+                        logging.info(f"F9 raw: {text}")
+                        if not _capture_session and try_voice_command(text):
+                            pass   # executed (or consumed) a voice command — no paste
+                        else:
+                            cleaned, press_enter = process_commands(
+                                text, radio="over" if MANUAL_OVER else False)
+                            if cleaned:
+                                cleaned = llm_cleanup(cleaned)
+                            deliver_text(cleaned, press_enter, raw=text)
+                    else:
+                        logging.info("No speech detected")
                 else:
-                    logging.info("No speech detected")
-            else:
-                logging.info("No audio captured")
-
-            manual_chunks = []
-            with state_lock:
-                state = State.IDLE
-            update_tray()
+                    logging.info("No audio captured")
+            finally:
+                manual_chunks = []
+                with state_lock:
+                    state = State.IDLE
+                update_tray()
 
     except Exception as e:
         logging.exception("Error in on_release")
 
 def on_click(x, y, button, pressed):
     """Mouse button handler - the configured PTT mouse button acts as PTT."""
-    global state, manual_chunks
+    global state, manual_chunks, _capture_session, _capture_struct
     try:
         # Binding mode: capture a mouse button as the new PTT button.
         with _binding_lock:
@@ -1091,7 +2360,16 @@ def on_click(x, y, button, pressed):
             return    # swallow all clicks while a bind is pending
 
         if button == PTT_MOUSE_BUTTON:
+            if _toggle_session:
+                if pressed:
+                    _lockout_beep()   # audible "open recording active"
+                return
             if pressed:
+                if _ctrl_down:
+                    # Ctrl+<PTT button> belongs to an external chord macro
+                    # (e.g. Ctrl+MB5 quick-note) — don't start recording.
+                    logging.info("PTT mouse button ignored (Ctrl held — chord)")
+                    return
                 # Middle button pressed - start recording
                 with state_lock:
                     if state == State.MANUAL:
@@ -1101,6 +2379,10 @@ def on_click(x, y, button, pressed):
                     state = State.MANUAL
                 update_tray()
                 manual_chunks = []
+                # Mouse PTT is always a plain dictation — declare the session kind
+                # so a leaked capture flag can't route this paste into the note file.
+                _capture_session = False
+                _capture_struct = False
                 if prev in (State.BUFFERING, State.CHECKING):
                     restore_audio()
                     logging.info("Thumb button interrupted VAD recording")
@@ -1128,39 +2410,49 @@ def on_click(x, y, button, pressed):
                     except queue.Empty:
                         break
 
-                if manual_chunks:
-                    audio = np.concatenate(manual_chunks)
-                    text = transcribe(audio)
-                    if text.strip():
-                        logging.info(f"Thumb button raw: {text}")
-                        cleaned, press_enter = process_commands(text, radio=False)
-                        if cleaned or press_enter:
-                            paste_text(cleaned, press_enter)
+                # try/finally mirrors finish_recording: a transcribe/deliver
+                # exception must never leave the tray wedged in PROCESSING.
+                try:
+                    if manual_chunks:
+                        audio = np.concatenate(manual_chunks)
+                        text = transcribe(audio)
+                        if text.strip():
+                            logging.info(f"Thumb button raw: {text}")
+                            if not _capture_session and try_voice_command(text):
+                                pass   # executed (or consumed) a voice command — no paste
+                            else:
+                                cleaned, press_enter = process_commands(
+                                    text, radio="over" if MANUAL_OVER else False)
+                                if cleaned:
+                                    cleaned = llm_cleanup(cleaned)
+                                deliver_text(cleaned, press_enter, raw=text)
+                        else:
+                            logging.info("No speech detected")
                     else:
-                        logging.info("No speech detected")
-                else:
-                    logging.info("No audio captured")
-
-                manual_chunks = []
-                with state_lock:
-                    state = State.IDLE
-                update_tray()
+                        logging.info("No audio captured")
+                finally:
+                    manual_chunks = []
+                    with state_lock:
+                        state = State.IDLE
+                    update_tray()
 
     except Exception as e:
         logging.exception("Error in on_click")
 
 # ── Main ────────────────────────────────────────────────────────────
 def run_listener():
-    global vad_model
+    global vad_model, _active_device_name
 
     _restart_event.clear()
 
     device = find_device()
     if device is None:
-        logging.error(f"Could not find {DEVICE_NAME}")
+        logging.error(f"No live input device among {DEVICE_NAME} "
+                      "(present-but-dead pins are skipped; retrying)")
         return False
 
-    logging.info(f"Using device: {sd.query_devices(device)['name']}")
+    _active_device_name = sd.query_devices(device)['name']
+    logging.info(f"Using device: {_active_device_name}")
     load_whisper()
 
     # Load VAD
@@ -1171,11 +2463,14 @@ def run_listener():
         logging.exception("Failed to load VAD, F9-only mode")
         vad_model = None
 
-    # Start VAD monitor thread
+    # Start VAD monitor thread. Bump the generation so any monitor from a
+    # previous run_listener() exits instead of racing this one for audio_q.
     if vad_model is not None:
-        t = threading.Thread(target=vad_monitor, daemon=True)
+        global _vad_generation
+        _vad_generation += 1
+        t = threading.Thread(target=vad_monitor, args=(_vad_generation,), daemon=True)
         t.start()
-        logging.info("VAD monitor thread started")
+        logging.info(f"VAD monitor thread started (gen {_vad_generation})")
 
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, device=device,
                         callback=audio_callback, blocksize=1600):
@@ -1189,9 +2484,33 @@ def run_listener():
                 _restart_event.wait(timeout=0.25)
     return True
 
+def _acquire_single_instance():
+    """Named Windows mutex so two PTT workers never fight over the mic and
+    hotkeys. Auto-released by the OS on process death, so a hard-killed
+    prior run can't leave a stale lock (unlike a lockfile). The venv
+    pythonw shim + Python311 worker pair is ONE logical instance -- only
+    the worker runs main(), so the pair never trips this. Returns the
+    mutex handle (held for process lifetime) or None if another instance
+    already holds it."""
+    import ctypes
+    ERROR_ALREADY_EXISTS = 183
+    handle = ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\WhisperPTT_SingleInstance")
+    if not handle:
+        logging.warning("Single-instance mutex creation failed; continuing unguarded")
+        return handle
+    if ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return None
+    return handle
+
 def main():
+    _instance_mutex = _acquire_single_instance()  # held until process exit
+    if _instance_mutex is None:
+        logging.info("Another PTT instance is already running; exiting")
+        sys.exit(0)
     logging.info("PTT starting")
     start_tray()                  # once; tray outlives run_listener() restarts
+    start_indicator()             # once; parks off-screen until recording
 
     while True:
         try:
